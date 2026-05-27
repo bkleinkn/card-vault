@@ -1,0 +1,15 @@
+{
+  "name": "card-vault",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Card Vault — root tooling (dev/build helpers). App code lives in public/, Cloud Functions in functions/.",
+  "type": "module",
+  "scripts": {
+    "icons": "node scripts/generate-icons.mjs",
+    "serve": "firebase serve --only hosting",
+    "deploy": "firebase deploy"
+  },
+  "devDependencies": {
+    "sharp": "^0.33.5"
+  }
+}

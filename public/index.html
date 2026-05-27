@@ -1,0 +1,112 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <meta name="theme-color" content="#0b3d2e" />
+  <title>Card Vault</title>
+  <link rel="manifest" href="manifest.json" />
+  <link rel="icon" href="icons/icon-192.png" />
+  <link rel="apple-touch-icon" href="icons/icon-192.png" />
+  <link rel="stylesheet" href="app.css" />
+</head>
+<body>
+  <header class="topbar">
+    <h1>Card Vault</h1>
+    <div class="topbar-right">
+      <div id="user-chip" class="user-chip" aria-live="polite"></div>
+      <a href="#/about" class="topbar-link">About</a>
+    </div>
+  </header>
+
+  <main id="view-root">
+    <!-- Scan view -->
+    <section class="view" data-view="scan">
+      <div class="scan-hero">
+        <h2>Scan a card</h2>
+        <p class="muted">Lay the card flat in good light. Fill the frame so the year and player name are easy to read.</p>
+      </div>
+
+      <label class="big-button primary">
+        Take photo of front
+        <input id="capture-front" type="file" accept="image/*" capture="environment" hidden />
+      </label>
+
+      <label class="big-button">
+        Take photo of back (optional)
+        <input id="capture-back" type="file" accept="image/*" capture="environment" hidden />
+      </label>
+
+      <div id="scan-previews" class="previews"></div>
+
+      <button id="identify-btn" class="big-button primary" disabled>Identify card</button>
+
+      <p id="scan-status" class="status" aria-live="polite"></p>
+    </section>
+
+    <!-- Result view -->
+    <section class="view" data-view="result" hidden>
+      <h2>Identified</h2>
+      <div id="result-card" class="result-card"></div>
+      <div id="result-notes-wrap" class="notes-section">
+        <label for="result-notes">Notes (optional)</label>
+        <textarea id="result-notes" placeholder="e.g. From Grandpa's collection, found in basement box"></textarea>
+      </div>
+      <div class="row">
+        <button id="save-btn" class="big-button primary">Save to collection</button>
+        <button id="rescan-btn" class="big-button">Re-scan</button>
+      </div>
+    </section>
+
+    <!-- Collection view -->
+    <section class="view" data-view="collection" hidden>
+      <div class="collection-header">
+        <h2>My collection</h2>
+        <p id="collection-total" class="muted"></p>
+      </div>
+      <input id="collection-search" type="search" placeholder="Search player, year, set..." class="search-input" />
+      <div id="collection-list" class="collection-list"></div>
+      <div id="collection-empty" class="empty-state" hidden></div>
+    </section>
+
+    <!-- Detail view -->
+    <section class="view" data-view="detail" hidden>
+      <button id="back-btn" class="link-button">&larr; Back</button>
+      <div id="detail-content"></div>
+    </section>
+
+    <!-- About view -->
+    <section class="view" data-view="about" hidden>
+      <h2>About Card Vault</h2>
+      <p>Card Vault helps you figure out what your sports cards are and roughly what they may be worth. Take a photo, the app identifies the card, and you can save it to a personal collection.</p>
+
+      <h3>How to scan well</h3>
+      <ul class="about-list">
+        <li>Lay the card on a flat, non-shiny surface.</li>
+        <li>Use good light &mdash; natural daylight is best.</li>
+        <li>Fill the frame with the card.</li>
+        <li>Make sure the player's name and the year are easy to read.</li>
+      </ul>
+
+      <h3>About the value estimate</h3>
+      <p>The dollar range is a <strong>rough ballpark</strong>. It does not know the exact condition of your card and it does not see live market prices.</p>
+      <p>Before buying or selling, always confirm with recent eBay "sold" listings. On eBay, search the card (for example, <em>"1956 Topps Mickey Mantle 135"</em>) and filter to <strong>Sold Items</strong>.</p>
+
+      <h3>When to call a professional</h3>
+      <p>For any single card that might be worth $500 or more, get a second opinion before selling. Reputable card-grading companies like <strong>PSA</strong>, <strong>SGC</strong>, and <strong>BGS</strong> will give you an official condition grade and a more reliable value.</p>
+
+      <h3>Your privacy</h3>
+      <p>Your card photos and collection are stored privately under your account. Only you can see them.</p>
+
+      <p class="muted" style="margin-top: 32px;">Made for collectors and for families going through inherited collections.</p>
+    </section>
+  </main>
+
+  <nav class="bottomnav" role="navigation" aria-label="Main">
+    <a href="#/scan" class="navlink" data-nav="scan">Scan</a>
+    <a href="#/collection" class="navlink" data-nav="collection">Collection</a>
+  </nav>
+
+  <script type="module" src="app.js"></script>
+</body>
+</html>
