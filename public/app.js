@@ -1144,7 +1144,27 @@ document.addEventListener("click", async (e) => {
 route();
 
 if ("serviceWorker" in navigator) {
-  window.addEventListener("load", () => {
-    navigator.serviceWorker.register("sw.js").catch(() => {});
+  window.addEventListener("load", async () => {
+    try {
+      const registration = await navigator.serviceWorker.register("sw.js");
+
+      // When a new SW takes over, reload so the live page runs against fresh
+      // assets. skipWaiting() in sw.js means the new SW activates immediately
+      // after install, so this fires shortly after a deploy is detected.
+      registration.addEventListener("updatefound", () => {
+        const newSW = registration.installing;
+        if (!newSW) return;
+        newSW.addEventListener("statechange", () => {
+          if (newSW.state === "activated" && navigator.serviceWorker.controller) {
+            window.location.reload();
+          }
+        });
+      });
+
+      // Poll every 60 seconds so a long-open tab eventually catches deploys.
+      setInterval(() => registration.update().catch(() => {}), 60_000);
+    } catch (err) {
+      console.warn("Service worker registration failed:", err);
+    }
   });
 }
