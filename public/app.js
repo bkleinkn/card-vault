@@ -221,8 +221,13 @@ function showView(name) {
 
 function route() {
   const hash = location.hash || "#/scan";
+  const isScan = hash === "#" || hash === "" || hash.startsWith("#/scan");
+  if (!isScan) stopScanCamera();
+
   if (hash.startsWith("#/scan")) {
     showView("scan");
+    autoCaptureSuspended = false;
+    startScanCamera();
   } else if (hash.startsWith("#/collection")) {
     showView("collection");
     renderCollection();
@@ -238,6 +243,8 @@ function route() {
     showView("guide");
   } else {
     showView("scan");
+    autoCaptureSuspended = false;
+    startScanCamera();
   }
 }
 window.addEventListener("hashchange", route);
@@ -247,15 +254,20 @@ const previewsEl = document.getElementById("scan-previews");
 const identifyBtn = document.getElementById("identify-btn");
 const scanStatus = document.getElementById("scan-status");
 const resultNotesEl = document.getElementById("result-notes");
+const captureFrontInput = document.getElementById("capture-front");
+const captureBackInput = document.getElementById("capture-back");
 
-document.getElementById("capture-front").addEventListener("change", (e) => {
+// File-upload fallback (camera unavailable / blocked). The user picks a front
+// (and optional back), then taps Identify — no auto-run, so the back isn't
+// skipped.
+captureFrontInput.addEventListener("change", (e) => {
   const f = e.target.files?.[0];
   if (!f) return;
   state.frontFile = f;
   renderPreviews();
 });
 
-document.getElementById("capture-back").addEventListener("change", (e) => {
+captureBackInput.addEventListener("change", (e) => {
   const f = e.target.files?.[0];
   if (!f) return;
   state.backFile = f;
@@ -276,13 +288,18 @@ function renderPreviews() {
     img.src = URL.createObjectURL(state.backFile);
     previewsEl.appendChild(img);
   }
+  // The button is the manual trigger for the file-upload fallback; the live
+  // autoscan path identifies on its own and navigates away.
+  identifyBtn.hidden = !state.frontFile;
   identifyBtn.disabled = !state.frontFile;
 }
 
-identifyBtn.addEventListener("click", async () => {
+identifyBtn.addEventListener("click", runIdentify);
+
+async function runIdentify() {
   if (!state.frontFile) return;
   identifyBtn.disabled = true;
-  scanStatus.textContent = "Looking at your card...";
+  scanStatus.textContent = "Looking at your card…";
   try {
     const result = await identifyCard(state.frontFile, state.backFile);
     state.lastIdentified = result;
@@ -292,9 +309,240 @@ identifyBtn.addEventListener("click", async () => {
     location.hash = "#/result";
   } catch (err) {
     console.error(err);
-    scanStatus.textContent = "Sorry, couldn't read this one. Try a clearer photo in better light.";
+    scanStatus.textContent = "Couldn't identify that one. Hold steady to try again, or tap Capture now.";
+    // Resume a live preview so a retry is one steady hold away, but suspend
+    // AUTO-capture so a persistent failure can't loop and hammer the API.
+    if ((location.hash || "#/scan").startsWith("#/scan")) {
+      autoCaptureSuspended = true;
+      startScanCamera();
+    }
   } finally {
     identifyBtn.disabled = false;
+  }
+}
+
+// --- Autoscan camera -------------------------------------------------------
+// Live camera with hands-free capture: when the frame is sharp (in focus) and
+// the phone is held steady for a beat, we grab a full-res frame and identify it
+// automatically — no shutter tap. Falls back to file upload when the camera is
+// unavailable or permission is denied.
+const cameraStage = document.getElementById("camera-stage");
+const cameraVideo = document.getElementById("camera-video");
+const cameraHint = document.getElementById("camera-hint");
+const autoscanFill = document.getElementById("autoscan-fill");
+const captureNowBtn = document.getElementById("capture-now-btn");
+const enableCameraBtn = document.getElementById("enable-camera-btn");
+const cameraFallback = document.getElementById("camera-fallback");
+
+// Tunables — adjust by feel on-device.
+const ANALYZE_W = 192;        // downscaled width for the focus/stability math
+const ANALYZE_INTERVAL = 140; // ms between frame analyses
+const STABLE_DIFF = 4.2;      // mean per-pixel gray delta below this = "steady"
+const SHARP_MIN = 22;         // variance-of-Laplacian floor = "in focus"
+const READY_FRAMES = 5;       // consecutive good frames before auto-capture
+
+let cameraStream = null;
+let analyzeTimer = null;
+let prevGray = null;
+let steadyCount = 0;
+let capturing = false;          // guards against double-capture mid-identify
+let autoCaptureSuspended = false; // true after a failed identify (manual retry)
+const analyzeCanvas = document.createElement("canvas");
+const analyzeCtx = analyzeCanvas.getContext("2d", { willReadFrequently: true });
+
+function camSupported() {
+  return !!(navigator.mediaDevices && navigator.mediaDevices.getUserMedia);
+}
+
+function setHint(text) {
+  cameraHint.textContent = text;
+  cameraHint.hidden = !text;
+}
+
+function setAutoscanProgress(p) {
+  autoscanFill.style.width = `${Math.round(Math.max(0, Math.min(1, p)) * 100)}%`;
+}
+
+function showCameraFallback(msg) {
+  cameraFallback.hidden = false;
+  cameraFallback.open = true;
+  captureNowBtn.hidden = true;
+  if (msg) scanStatus.textContent = msg;
+}
+
+async function startScanCamera() {
+  if (capturing) return;              // mid-identify; leave things alone
+  if (!camSupported()) {
+    cameraStage.hidden = true;
+    showCameraFallback("This browser can't open the camera here. Upload a photo instead.");
+    return;
+  }
+  if (cameraStream) {                 // already running — just (re)start analysis
+    runAnalyzeLoop();
+    return;
+  }
+  enableCameraBtn.hidden = true;
+  try {
+    cameraStream = await navigator.mediaDevices.getUserMedia({
+      video: { facingMode: { ideal: "environment" }, width: { ideal: 1920 }, height: { ideal: 1080 } },
+      audio: false,
+    });
+  } catch (err) {
+    console.warn("getUserMedia failed:", err && err.name, err && err.message);
+    cameraStage.hidden = true;
+    if (err && (err.name === "NotAllowedError" || err.name === "SecurityError")) {
+      // Permission denied, or the browser wants a user gesture first.
+      enableCameraBtn.hidden = false;
+      showCameraFallback("Camera is blocked. Tap “Enable camera,” or upload a photo.");
+    } else {
+      showCameraFallback("No camera available. Upload a photo instead.");
+    }
+    return;
+  }
+  cameraVideo.srcObject = cameraStream;
+  try { await cameraVideo.play(); } catch (_) { /* autoplay attribute usually covers it */ }
+  cameraStage.hidden = false;
+  captureNowBtn.hidden = false;
+  cameraFallback.hidden = false;      // keep the escape hatch reachable, collapsed
+  scanStatus.textContent = "";
+  steadyCount = 0;
+  prevGray = null;
+  setAutoscanProgress(0);
+  setHint(autoCaptureSuspended ? "Tap Capture now to try again" : "Point at a card");
+  runAnalyzeLoop();
+}
+
+function stopScanCamera() {
+  if (analyzeTimer) { clearInterval(analyzeTimer); analyzeTimer = null; }
+  if (cameraStream) {
+    cameraStream.getTracks().forEach((t) => t.stop());
+    cameraStream = null;
+  }
+  cameraVideo.srcObject = null;
+  cameraStage.hidden = true;
+  cameraStage.classList.remove("is-ready");
+  captureNowBtn.hidden = true;
+  setAutoscanProgress(0);
+}
+
+function runAnalyzeLoop() {
+  if (analyzeTimer) clearInterval(analyzeTimer);
+  analyzeTimer = setInterval(analyzeFrame, ANALYZE_INTERVAL);
+}
+
+function analyzeFrame() {
+  if (capturing || !cameraStream) return;
+  if (autoCaptureSuspended) {
+    setHint("Tap Capture now to try again");
+    setAutoscanProgress(0);
+    cameraStage.classList.remove("is-ready");
+    return;
+  }
+  const vw = cameraVideo.videoWidth, vh = cameraVideo.videoHeight;
+  if (!vw || !vh) return;
+  const w = ANALYZE_W;
+  const h = Math.max(1, Math.round((vh / vw) * w));
+  analyzeCanvas.width = w;
+  analyzeCanvas.height = h;
+  analyzeCtx.drawImage(cameraVideo, 0, 0, w, h);
+  let data;
+  try { data = analyzeCtx.getImageData(0, 0, w, h).data; } catch (_) { return; }
+
+  // Grayscale
+  const gray = new Float32Array(w * h);
+  for (let i = 0, p = 0; i < data.length; i += 4, p++) {
+    gray[p] = 0.299 * data[i] + 0.587 * data[i + 1] + 0.114 * data[i + 2];
+  }
+
+  // Sharpness — variance of the Laplacian over interior pixels
+  let lapSum = 0, lapSqSum = 0, n = 0;
+  for (let y = 1; y < h - 1; y++) {
+    for (let x = 1; x < w - 1; x++) {
+      const idx = y * w + x;
+      const lap = 4 * gray[idx] - gray[idx - 1] - gray[idx + 1] - gray[idx - w] - gray[idx + w];
+      lapSum += lap;
+      lapSqSum += lap * lap;
+      n++;
+    }
+  }
+  const lapMean = lapSum / n;
+  const sharpness = lapSqSum / n - lapMean * lapMean;
+
+  // Stability — mean absolute gray delta vs the previous frame
+  let diff = Infinity;
+  if (prevGray && prevGray.length === gray.length) {
+    let s = 0;
+    for (let i = 0; i < gray.length; i++) s += Math.abs(gray[i] - prevGray[i]);
+    diff = s / gray.length;
+  }
+  prevGray = gray;
+
+  const sharp = sharpness >= SHARP_MIN;
+  const steady = diff <= STABLE_DIFF;
+
+  if (!sharp && steady) setHint("Focusing… move a little closer or add light");
+  else if (!steady) setHint("Hold steady");
+  else setHint("Hold it…");
+
+  steadyCount = sharp && steady ? steadyCount + 1 : 0;
+  cameraStage.classList.toggle("is-ready", steadyCount >= 2);
+  setAutoscanProgress(steadyCount / READY_FRAMES);
+
+  if (steadyCount >= READY_FRAMES) captureAndIdentify();
+}
+
+async function captureFrameFile() {
+  const vw = cameraVideo.videoWidth, vh = cameraVideo.videoHeight;
+  const maxDim = 1600;
+  const scale = Math.min(1, maxDim / Math.max(vw, vh));
+  const w = Math.round(vw * scale), h = Math.round(vh * scale);
+  const c = document.createElement("canvas");
+  c.width = w;
+  c.height = h;
+  c.getContext("2d").drawImage(cameraVideo, 0, 0, w, h);
+  const blob = await new Promise((res) => c.toBlob(res, "image/jpeg", 0.9));
+  return new File([blob], "front.jpg", { type: "image/jpeg" });
+}
+
+async function captureAndIdentify() {
+  if (capturing || !cameraStream) return;
+  capturing = true;
+  autoCaptureSuspended = false;
+  setHint("Got it!");
+  cameraStage.classList.add("is-ready");
+  setAutoscanProgress(1);
+  let file;
+  try {
+    file = await captureFrameFile();
+  } catch (err) {
+    console.error("Frame capture failed", err);
+    capturing = false;
+    return;
+  }
+  stopScanCamera();
+  state.frontFile = file;
+  state.backFile = null;
+  renderPreviews();
+  capturing = false;
+  await runIdentify();
+}
+
+captureNowBtn.addEventListener("click", () => {
+  if (!capturing && cameraStream) captureAndIdentify();
+});
+
+enableCameraBtn.addEventListener("click", () => {
+  enableCameraBtn.hidden = true;
+  autoCaptureSuspended = false;
+  startScanCamera();
+});
+
+// Release the camera when the tab is hidden; resume on return if still scanning.
+document.addEventListener("visibilitychange", () => {
+  if (document.hidden) {
+    stopScanCamera();
+  } else if (!capturing && (location.hash || "#/scan").startsWith("#/scan")) {
+    startScanCamera();
   }
 });
 

@@ -320,6 +320,92 @@ p { color: var(--ink-soft); margin: 8px 0; }
   letter-spacing: 0.02em;
 }
 
+/* ---------- Live camera autoscan ---------- */
+.camera-stage {
+  position: relative;
+  width: 100%;
+  aspect-ratio: 3 / 4;
+  max-height: 64vh;
+  margin: 4px 0 14px;
+  border-radius: var(--radius);
+  overflow: hidden;
+  background: #000;
+  border: 1px solid var(--border-strong);
+  box-shadow: var(--shadow-glow);
+}
+
+.camera-stage video {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
+}
+
+/* Card-proportioned framing guide; dims everything outside it */
+.camera-guide {
+  position: absolute;
+  inset: 8% 12%;
+  border: 2px solid rgba(199, 210, 254, 0.55);
+  border-radius: 14px;
+  box-shadow: 0 0 0 100vmax rgba(2, 6, 23, 0.34);
+  transition: border-color 0.15s ease;
+  pointer-events: none;
+}
+
+.camera-stage.is-ready .camera-guide {
+  border-color: var(--success-text);
+  box-shadow: 0 0 0 100vmax rgba(2, 6, 23, 0.18), 0 0 18px rgba(52, 211, 153, 0.5);
+}
+
+.camera-hint {
+  position: absolute;
+  left: 50%;
+  bottom: 16px;
+  transform: translateX(-50%);
+  max-width: 88%;
+  text-align: center;
+  font-family: var(--font-mono);
+  font-size: 13px;
+  letter-spacing: 0.02em;
+  color: var(--ink);
+  background: rgba(2, 6, 23, 0.72);
+  border: 1px solid var(--border-strong);
+  padding: 7px 14px;
+  border-radius: var(--radius-pill);
+  backdrop-filter: blur(4px);
+  pointer-events: none;
+}
+
+.autoscan-track {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  height: 4px;
+  background: rgba(199, 210, 254, 0.12);
+}
+
+.autoscan-fill {
+  height: 100%;
+  width: 0%;
+  background: linear-gradient(90deg, var(--accent), var(--accent-soft));
+  transition: width 0.12s linear;
+}
+
+.camera-fallback { margin: 6px 0 0; }
+.camera-fallback > summary {
+  cursor: pointer;
+  color: var(--ink-soft);
+  font-size: 14px;
+  padding: 6px 0;
+}
+.camera-fallback-body {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  margin-top: 10px;
+}
+
 /* Decorative branding mark below the scan controls */
 .scan-mark {
   display: flex;

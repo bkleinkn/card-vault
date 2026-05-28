@@ -28,22 +28,36 @@
     <section class="view" data-view="scan">
       <div class="scan-hero">
         <h2>Scan a card</h2>
-        <p class="muted">Lay the card flat in good light. Fill the frame so the year and player name are easy to read.</p>
+        <p class="muted">Point the camera at a card and hold steady &mdash; it captures on its own once the picture is sharp. Good light helps.</p>
       </div>
 
-      <label class="big-button primary">
-        Take photo of front
-        <input id="capture-front" type="file" accept="image/*" capture="environment" hidden />
-      </label>
+      <div id="camera-stage" class="camera-stage" hidden>
+        <video id="camera-video" playsinline muted autoplay></video>
+        <div class="camera-guide" aria-hidden="true"></div>
+        <div id="camera-hint" class="camera-hint">Starting camera&hellip;</div>
+        <div class="autoscan-track" aria-hidden="true"><div id="autoscan-fill" class="autoscan-fill"></div></div>
+      </div>
 
-      <label class="big-button">
-        Take photo of back (optional)
-        <input id="capture-back" type="file" accept="image/*" capture="environment" hidden />
-      </label>
+      <button id="enable-camera-btn" class="big-button primary" hidden>Enable camera</button>
+      <button id="capture-now-btn" class="big-button" hidden>Capture now</button>
+
+      <details id="camera-fallback" class="camera-fallback" hidden>
+        <summary>Camera not working? Upload a photo instead</summary>
+        <div class="camera-fallback-body">
+          <label class="big-button">
+            Choose front photo
+            <input id="capture-front" type="file" accept="image/*" capture="environment" hidden />
+          </label>
+          <label class="big-button">
+            Choose back photo (optional)
+            <input id="capture-back" type="file" accept="image/*" capture="environment" hidden />
+          </label>
+        </div>
+      </details>
 
       <div id="scan-previews" class="previews"></div>
 
-      <button id="identify-btn" class="big-button primary" disabled>Identify card</button>
+      <button id="identify-btn" class="big-button primary" hidden disabled>Identify card</button>
 
       <p id="scan-status" class="status" aria-live="polite"></p>
 
