@@ -383,10 +383,11 @@ function renderResult(data) {
       <span class="badge">Confidence ${Math.round((identified.confidence || 0) * 100)}%</span>
     </div>
     <div class="value-block">
-      <div class="label muted">Rough value</div>
+      <div class="label muted">Claude AI ballpark</div>
       <div class="range">$${fmt(valueEstimate?.low || 0)} &ndash; $${fmt(valueEstimate?.high || 0)}</div>
       <div class="note">${esc(valueEstimate?.note || "")}</div>
     </div>
+    ${renderEbayBlock(data.ebayPrices)}
     <button id="edit-details-btn" class="link-button" style="margin-top: 10px;">Edit details</button>
     ${ebaySectionHTML({ ...data, userNotes: state.notes })}
   `;
@@ -511,6 +512,7 @@ document.getElementById("save-btn").addEventListener("click", async () => {
       imageBackUrl: backUrl,
       identified: state.lastIdentified.identified,
       valueEstimate: state.lastIdentified.valueEstimate,
+      ebayPrices: state.lastIdentified.ebayPrices || null,
       userNotes: state.notes || null,
     });
     state.frontFile = null;
@@ -895,10 +897,11 @@ function renderDetailDisplay(el) {
         ${typeof c.identified?.confidence === "number" ? `<span class="badge">Confidence ${Math.round(c.identified.confidence * 100)}%</span>` : ""}
       </div>
       <div class="value-block">
-        <div class="label muted">Rough value</div>
+        <div class="label muted">Claude AI ballpark</div>
         <div class="range">$${fmt(c.valueEstimate?.low || 0)} &ndash; $${fmt(c.valueEstimate?.high || 0)}</div>
         <div class="note">${esc(c.valueEstimate?.note || "")}</div>
       </div>
+      ${renderEbayBlock(c.ebayPrices)}
     </div>
     ${c.userNotes ? `<div class="notes-display">${esc(c.userNotes)}</div>` : ""}
     ${ebaySectionHTML(c)}
@@ -986,6 +989,23 @@ function esc(s) {
 
 function fmt(n) {
   return Number(n || 0).toLocaleString("en-US");
+}
+
+// Render the eBay sold-listings block. Returns "" if no data so the result
+// view collapses cleanly when Claude couldn't find a match or eBay was blocked.
+function renderEbayBlock(ebay) {
+  if (!ebay || !ebay.count) return "";
+  if (ebay.count === 0) return "";
+  const median = ebay.median != null ? `$${fmt(ebay.median)}` : "—";
+  const range = ebay.min != null && ebay.max != null ? `$${fmt(ebay.min)} – $${fmt(ebay.max)}` : "—";
+  const link = ebay.searchUrl ? `<a href="${esc(ebay.searchUrl)}" target="_blank" rel="noopener">View on eBay &rarr;</a>` : "";
+  return `
+    <div class="value-block ebay-block">
+      <div class="label muted">eBay sold (recent)</div>
+      <div class="range">${median}</div>
+      <div class="note">Median across ${ebay.count} recent sales. Range ${range}. Mixed conditions — may include graded cards.<br/>${link}</div>
+    </div>
+  `;
 }
 
 function escAttr(s) {

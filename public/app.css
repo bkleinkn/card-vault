@@ -582,6 +582,30 @@ p { color: var(--ink-soft); margin: 8px 0; }
   color: var(--success-text);
 }
 
+/* eBay sold-listings block, paired alongside the Claude AI ballpark in
+   value-block layouts. Emerald tint to distinguish real-market data from
+   AI-estimated. */
+.value-block.ebay-block {
+  margin-top: 10px;
+  background: var(--success-bg);
+  border-color: var(--success-border);
+  border-left: 3px solid var(--success-text);
+}
+.value-block.ebay-block .label {
+  color: var(--success-text);
+}
+.value-block.ebay-block .range {
+  color: var(--success-text);
+}
+.value-block.ebay-block a {
+  color: var(--success-text);
+  font-weight: 600;
+}
+.value-block.ebay-block a:hover {
+  color: var(--success-text);
+  text-decoration: underline;
+}
+
 /* ---------- Empty state ---------- */
 .empty-state {
   text-align: center;

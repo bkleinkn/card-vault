@@ -175,6 +175,75 @@ exports.identifyCard = onCall(
     if (parsed.valueEstimate) {
       parsed.valueEstimate.estimatedAt = new Date().toISOString();
     }
+
+    // After Claude identifies the card, scrape eBay's sold-listings page for
+    // real recent sales. Second pricing source, free, no API key needed.
+    // Fails gracefully — null result if blocked or HTML changes, in which case
+    // the client just shows Claude's ballpark alone.
+    const ident = parsed.identified;
+    if (ident && ident.player && ident.player !== "Unknown card") {
+      const queryParts = [ident.year, ident.set, ident.player, ident.cardNumber].filter(Boolean);
+      const ebayQuery = queryParts.join(" ");
+      parsed.ebayPrices = await fetchEbaySoldPrices(ebayQuery);
+    }
+
     return parsed;
   },
 );
+
+// Scrape eBay's sold-listings page for the given free-text query and return
+// median / min / max / count, or null on any failure. User-Agent mimics a real
+// browser because eBay returns an empty body to the default Node fetch UA.
+async function fetchEbaySoldPrices(query, maxResults = 60) {
+  const url = `https://www.ebay.com/sch/i.html?_nkw=${encodeURIComponent(query)}&LH_Sold=1&LH_Complete=1&_ipg=${maxResults}`;
+  try {
+    const response = await fetch(url, {
+      headers: {
+        "User-Agent":
+          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        Accept: "text/html,application/xhtml+xml,application/xml;q=0.9",
+        "Accept-Language": "en-US,en;q=0.9",
+      },
+    });
+    if (!response.ok) {
+      console.warn(`eBay fetch returned ${response.status} for query "${query}"`);
+      return null;
+    }
+    const html = await response.text();
+
+    // Match sold-listing prices. eBay's HTML uses s-item__price spans. Some
+    // listings show ranges (e.g. "$5 to $20") — we skip those and keep
+    // single-value prices only for cleaner median.
+    const priceMatches = [
+      ...html.matchAll(
+        /<span class="s-item__price">[^<]*?\$([\d,]+(?:\.\d{2})?)[^<]*?<\/span>/g,
+      ),
+    ];
+    const prices = priceMatches
+      .map((m) => parseFloat(m[1].replace(/,/g, "")))
+      .filter((p) => !isNaN(p) && p > 0)
+      .slice(0, maxResults);
+
+    if (prices.length === 0) {
+      return { query, count: 0, searchUrl: url };
+    }
+
+    prices.sort((a, b) => a - b);
+    const median = prices[Math.floor(prices.length / 2)];
+    const min = prices[0];
+    const max = prices[prices.length - 1];
+
+    return {
+      median: Math.round(median * 100) / 100,
+      min: Math.round(min * 100) / 100,
+      max: Math.round(max * 100) / 100,
+      count: prices.length,
+      query,
+      searchUrl: url,
+      fetchedAt: new Date().toISOString(),
+    };
+  } catch (err) {
+    console.warn(`eBay fetch failed for "${query}":`, err.message);
+    return null;
+  }
+}
