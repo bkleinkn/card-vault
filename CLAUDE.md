@@ -27,7 +27,7 @@ If a feature requires collector jargon to use, it doesn't belong in v1.
 ### IN
 
 1. **Scan** — take a photo of the front of a card (optional back), preview, hit Identify
-2. **AI identify** — Cloud Function calls OpenAI Vision and returns: sport, year, set/manufacturer, player, card number, rookie flag, HOF flag, confidence
+2. **AI identify** — Cloud Function calls Claude Opus 4.7 (Anthropic SDK) and returns: sport, year, set/manufacturer, player, card number, team, rookie flag, HOF flag, confidence
 3. **Rough value estimate** — same vision call asks for a ballpark range labeled clearly as *rough — verify with eBay sold listings*
 4. **Save to collection** — write card + image URL to Firestore
 5. **View collection** — list view with thumbnails, totals, basic search/filter
@@ -59,7 +59,7 @@ eBay's public sold-listings API was deprecated. Real options:
 
 ### Card database
 
-TCDB has no public API. For MVP we lean on OpenAI Vision's knowledge of mainstream vintage sets (Topps, Bowman, Goudey, Play Ball, Leaf). Works reasonably well for famous players and well-known sets; weaker on obscure variants. Add a structured database integration in a later phase.
+TCDB has no public API. For MVP we lean on Claude's training knowledge of mainstream vintage sets (Topps, Bowman, Goudey, Play Ball, Leaf). Works reasonably well for famous players and well-known sets; weaker on obscure variants. Add a structured database integration in a later phase.
 
 ## Architecture
 
@@ -70,8 +70,9 @@ TCDB has no public API. For MVP we lean on OpenAI Vision's knowledge of mainstre
 [PWA: scan view]  --upload-->  [Cloud Storage: /scans/{uid}/{cardId}/front.jpg]
      |
      v
-[Cloud Function: identifyCard]  --calls-->  [OpenAI Vision API]
+[Cloud Function: identifyCard]  --calls-->  [Claude Opus 4.7 via Anthropic SDK]
      |                                       returns structured JSON
+     |                                       (output_config.format json_schema)
      v
 [PWA: result view]  --save-->  [Firestore: users/{uid}/cards/{cardId}]
      |
@@ -119,27 +120,31 @@ The collection view groups cards as **Manufacturer (set) → Year → Team** via
 ```
 card-vault/
   CLAUDE.md
-  firebase.json
-  .firebaserc                  (project ID placeholder)
-  firestore.rules
-  storage.rules
+  firebase.json                (excludes the icon source from deploy)
+  .firebaserc                  (default → card-vault-d8fa4)
+  firestore.rules              (owner-only)
+  storage.rules                (owner-only)
   .gitignore
   package.json                 (root tooling: sharp for icon generation)
+  package-lock.json
   public/
-    index.html
-    app.css
-    app.js
+    index.html                 (top gradient strip, About page, scan-mark)
+    app.css                    (Cosmic Slate tokens, all view styles)
+    app.js                     (firebaseConfig wired, USE_MOCK_AI flag, all views)
     manifest.json
-    sw.js
+    sw.js                      (network-first + skipWaiting/clients.claim)
     icons/
-      icon-192.png
-      icon-512.png
-      icon-maskable-512.png
+      card-vault-icon.png      (6.6MB source — Gemini output; not deployed)
+      icon-192.png             (transparent corners)
+      icon-512.png             (transparent corners; also used in scan view)
+      icon-maskable-512.png    (solid bg for OS masking)
   functions/
-    package.json
-    index.js                   (identifyCard onCall)
+    package.json               (@anthropic-ai/sdk)
+    package-lock.json
+    index.js                   (identifyCard onCall, Opus 4.7, adaptive thinking)
   scripts/
-    generate-icons.mjs         (npm run icons)
+    generate-icons.mjs         (npm run icons — SVG→PNG, legacy)
+    import-icon.mjs            (npm run icon:import — chroma-key + resize)
 ```
 
 ## Phases
@@ -152,12 +157,16 @@ card-vault/
 
 **Phase 3 (collection) — DONE.** Firestore CRUD, list view, detail view with edit flow, delete, search — all live and exercised via the deployed app.
 
-**Phase 4 (polish)** — High-value flagging, totals, edit flow, notes, confidence-aware copy: DONE. Basic CSV export still pending.
+**Phase 4 (polish) — DONE.** High-value flagging, totals, edit flow, notes, confidence-aware copy, CSV export, full search/sort/filter, Manufacturer→Year→Team hierarchical collection grouping, eBay listing generator with 1-click copy, custom Card Vault icon (transparent-cornered, also displayed in scan view), Cosmic Slate dark reskin (Inter + JetBrains Mono, slate-950 canvas, indigo accent, top gradient strip, glassmorphism). Network-first SW + auto-reload on update so deploys propagate to existing tabs within ~60s.
 
-**Phase 5+ (deferred features)** — real pricing data, condition grading, batch scan, selling assistance, etc.
+**Phase 5+ (deferred features)** — real pricing data, condition grading, batch scan, selling assistance, custom domain, etc.
 
-## Open questions (need answers before Phase 2)
+## Operational notes
 
-1. Firebase project: new dedicated `card-vault` project, or piggyback an existing one?
-2. OpenAI API key: existing key or new one for this project?
-3. Custom domain or `card-vault.web.app` for v1?
+- **Live URL:** [https://card-vault-d8fa4.web.app](https://card-vault-d8fa4.web.app)
+- **Firebase Console (direct link — bookmark; the org-parented project doesn't show in the default project list):** [console.firebase.google.com/project/card-vault-d8fa4/overview](https://console.firebase.google.com/project/card-vault-d8fa4/overview)
+- **GitHub:** [github.com/bkleinkn/card-vault](https://github.com/bkleinkn/card-vault)
+- **Per-scan cost:** ~$0.01–0.03 (Claude Opus 4.7 with prompt-caching kicking in after the first scan).
+- **Secret rotation:** if `ANTHROPIC_API_KEY` ever needs swapping, run `firebase functions:secrets:set ANTHROPIC_API_KEY --project=card-vault-d8fa4` then `firebase deploy --only functions --project=card-vault-d8fa4`.
+- **USE_MOCK_AI escape hatch:** Flip `const USE_MOCK_AI = true;` in `public/app.js` to temporarily revert all scans to the mocked 1956 Mantle without redeploying the function (useful for cost-free UX iteration). Then `firebase deploy --only hosting`.
+- **Cross-PC dev:** `git clone https://github.com/bkleinkn/card-vault.git && cd card-vault && npm install && cd functions && npm install`. Firebase deploys from any machine work after `firebase login` (as bkleinkn@gmail.com) — secrets stay server-side.
