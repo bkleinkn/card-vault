@@ -234,6 +234,8 @@ function route() {
     showView("result");
   } else if (hash.startsWith("#/about")) {
     showView("about");
+  } else if (hash.startsWith("#/guide")) {
+    showView("guide");
   } else {
     showView("scan");
   }
