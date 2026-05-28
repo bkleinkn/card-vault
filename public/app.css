@@ -319,6 +319,23 @@ p { color: var(--ink-soft); margin: 8px 0; }
   letter-spacing: 0.02em;
 }
 
+/* Decorative branding mark below the scan controls */
+.scan-mark {
+  display: flex;
+  justify-content: center;
+  margin-top: 36px;
+  padding-bottom: 12px;
+  pointer-events: none;
+}
+
+.scan-mark img {
+  width: 100%;
+  max-width: 220px;
+  height: auto;
+  opacity: 0.95;
+  filter: drop-shadow(0 8px 24px rgba(99, 102, 241, 0.18));
+}
+
 /* ---------- Result card ---------- */
 .result-card {
   background: var(--surface);
