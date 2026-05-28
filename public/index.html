@@ -132,7 +132,7 @@
     <!-- About view -->
     <section class="view" data-view="about" hidden>
       <h2>About Card Vault</h2>
-      <p>Card Vault helps you figure out what your sports cards are and roughly what they may be worth. Take a photo, the app identifies the card, and you can save it to a personal collection.</p>
+      <p>Card Vault helps you figure out what your sports cards are and roughly what they may be worth. Take a photo, the app identifies the card using AI, and you can save it to a personal collection.</p>
 
       <h3>How to scan well</h3>
       <ul class="about-list">
@@ -142,15 +142,32 @@
         <li>Make sure the player's name and the year are easy to read.</li>
       </ul>
 
-      <h3>About the value estimate</h3>
-      <p>The dollar range is a <strong>rough ballpark</strong>. It does not know the exact condition of your card and it does not see live market prices.</p>
-      <p>Before buying or selling, always confirm with recent eBay "sold" listings. On eBay, search the card (for example, <em>"1956 Topps Mickey Mantle 135"</em>) and filter to <strong>Sold Items</strong>.</p>
+      <h3>How the value estimate is calculated</h3>
+      <p>Card Vault uses <a href="https://www.anthropic.com/claude" target="_blank" rel="noopener">Claude</a>, an AI model from Anthropic, to identify the card and produce a rough value range. The estimate comes from the AI's training knowledge of historical card values &mdash; <strong>it does not query a live pricing database in real time.</strong></p>
+      <p>Plain language: the dollar range is a <strong>ballpark from the AI's general awareness</strong>, not a current market quote. The AI knows that, say, a 1956 Topps Mantle has historically traded in a certain range, but it can't see what the most recent one sold for yesterday.</p>
+      <p>Real pricing databases that exist (and that future versions of Card Vault may integrate):</p>
+      <ul class="about-list">
+        <li><a href="https://www.ebay.com/sch/i.html?LH_Sold=1&LH_Complete=1" target="_blank" rel="noopener">eBay &ndash; Sold Listings</a> &mdash; the gold standard for actual recent transactions</li>
+        <li><a href="https://www.pricecharting.com/category/baseball-cards" target="_blank" rel="noopener">PriceCharting</a> &mdash; comprehensive sports card price guide</li>
+        <li><a href="https://www.cardladder.com/" target="_blank" rel="noopener">Card Ladder</a> &mdash; tracks card values over time like stocks</li>
+        <li><a href="https://130point.com/" target="_blank" rel="noopener">130point.com</a> &mdash; aggregates eBay sold data</li>
+        <li><a href="https://www.tcdb.com/" target="_blank" rel="noopener">TCDB (Trading Card Database)</a> &mdash; community-maintained card catalog</li>
+      </ul>
+
+      <h3>How to verify before buying or selling</h3>
+      <p>Always check recent <a href="https://www.ebay.com/sch/i.html?LH_Sold=1&LH_Complete=1" target="_blank" rel="noopener">eBay Sold Items</a> for your specific card. Search the year, set, player, and card number (for example, <em>"1956 Topps Mickey Mantle 135"</em>) and filter to <strong>Sold Items</strong>. The most recent sales are the most accurate.</p>
 
       <h3>When to call a professional</h3>
-      <p>For any single card that might be worth $500 or more, get a second opinion before selling. Reputable card-grading companies like <strong>PSA</strong>, <strong>SGC</strong>, and <strong>BGS</strong> will give you an official condition grade and a more reliable value.</p>
+      <p>For any single card that might be worth $500 or more, get a second opinion before selling. Reputable card-grading companies will give you an official condition grade and a more reliable value:</p>
+      <ul class="about-list">
+        <li><a href="https://www.psacard.com/" target="_blank" rel="noopener">PSA (Professional Sports Authenticator)</a> &mdash; the most widely recognized sports card grading</li>
+        <li><a href="https://gosgc.com/" target="_blank" rel="noopener">SGC (Sportscard Guaranty)</a> &mdash; popular for vintage cards</li>
+        <li><a href="https://www.beckett.com/grading/" target="_blank" rel="noopener">BGS (Beckett Grading Services)</a> &mdash; precise sub-grades, often preferred for modern cards</li>
+      </ul>
+      <p>For especially high-value cards (estimate $5,000+), consider consigning to a major auction house like <a href="https://www.goldinauctions.com/" target="_blank" rel="noopener">Goldin</a>, <a href="https://www.heritage.com/sports/" target="_blank" rel="noopener">Heritage Auctions</a>, or <a href="https://memorabilia.collectiblesoftheday.com/" target="_blank" rel="noopener">Memory Lane</a>.</p>
 
       <h3>Your privacy</h3>
-      <p>Your card photos and collection are stored privately under your account. Only you can see them.</p>
+      <p>Your card photos and collection are stored privately under your account on Google's Firebase platform. Only you can see them. Card images are sent to Anthropic's Claude API for identification, then immediately forgotten by the model &mdash; Anthropic does not retain them or train on them (see their <a href="https://www.anthropic.com/legal/aup" target="_blank" rel="noopener">usage policy</a>).</p>
 
       <p class="muted" style="margin-top: 32px;">Made for collectors and for families going through inherited collections.</p>
     </section>
