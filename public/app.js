@@ -388,6 +388,7 @@ function renderResult(data) {
       <div class="note">${esc(valueEstimate?.note || "")}</div>
     </div>
     ${renderEbayBlock(data.ebayPrices)}
+    ${renderPriceLinks(identified)}
     <button id="edit-details-btn" class="link-button" style="margin-top: 10px;">Edit details</button>
     ${ebaySectionHTML({ ...data, userNotes: state.notes })}
   `;
@@ -902,6 +903,7 @@ function renderDetailDisplay(el) {
         <div class="note">${esc(c.valueEstimate?.note || "")}</div>
       </div>
       ${renderEbayBlock(c.ebayPrices)}
+      ${renderPriceLinks(c.identified)}
     </div>
     ${c.userNotes ? `<div class="notes-display">${esc(c.userNotes)}</div>` : ""}
     ${ebaySectionHTML(c)}
@@ -1004,6 +1006,34 @@ function renderEbayBlock(ebay) {
       <div class="label muted">eBay sold (recent)</div>
       <div class="range">${median}</div>
       <div class="note">Median across ${ebay.count} recent sales. Range ${range}. Mixed conditions — may include graded cards.<br/>${link}</div>
+    </div>
+  `;
+}
+
+// Build a row of "Compare on" links to external pricing sources we can't
+// scrape (anti-bot protection, paid APIs, etc.) — just send the user to a
+// pre-filled search URL on each site. Returns "" if no card to look up.
+function renderPriceLinks(identified) {
+  if (!identified || !identified.player || identified.player === "Unknown card") return "";
+  const query = [identified.year, identified.set, identified.player, identified.cardNumber]
+    .filter(Boolean)
+    .join(" ");
+  if (!query.trim()) return "";
+  const q = encodeURIComponent(query);
+  // Sites are independently URL-encoded; some accept + or %20 — both work.
+  const sources = [
+    { name: "eBay Sold", url: `https://www.ebay.com/sch/i.html?_nkw=${q}&LH_Sold=1&LH_Complete=1` },
+    { name: "SportsCardsPro", url: `https://www.sportscardspro.com/search-products?type=prices&q=${q}&go=Go` },
+    { name: "PriceCharting", url: `https://www.pricecharting.com/search-products?type=prices&q=${q}&go=Go` },
+    { name: "130point", url: `https://130point.com/cards/?q=${q}` },
+    { name: "TCDB", url: `https://www.tcdb.com/Search.cfm?Search=${q}` },
+  ];
+  return `
+    <div class="price-links">
+      <div class="label muted">Compare prices on</div>
+      <ul class="price-links-list">
+        ${sources.map((s) => `<li><a href="${esc(s.url)}" target="_blank" rel="noopener">${esc(s.name)} &rarr;</a></li>`).join("")}
+      </ul>
     </div>
   `;
 }

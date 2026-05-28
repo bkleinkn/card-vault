@@ -606,6 +606,58 @@ p { color: var(--ink-soft); margin: 8px 0; }
   text-decoration: underline;
 }
 
+/* "Compare prices on" — row of pill-shaped link buttons to external pricing
+   sites we can't scrape (anti-bot, paid APIs). Each opens in a new tab. */
+.price-links {
+  margin-top: 14px;
+  padding: 12px 16px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+}
+
+.price-links .label {
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.12em;
+  margin-bottom: 10px;
+  color: var(--ink-faint);
+}
+
+.price-links-list {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.price-links-list li { margin: 0; }
+
+.price-links-list a {
+  display: inline-flex;
+  align-items: center;
+  padding: 7px 12px;
+  background: var(--surface-3);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--ink-2);
+  text-decoration: none;
+  transition: background .15s, border-color .15s, color .15s;
+  white-space: nowrap;
+}
+
+.price-links-list a:hover {
+  background: var(--accent-strong);
+  border-color: var(--accent-strong);
+  color: white;
+  text-decoration: none;
+}
+
 /* ---------- Empty state ---------- */
 .empty-state {
   text-align: center;
