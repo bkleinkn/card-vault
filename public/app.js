@@ -36,15 +36,20 @@ import {
 // --- Firebase config -------------------------------------------------------
 // Filled in when the Firebase project is provisioned (see CLAUDE.md Phase 2).
 const firebaseConfig = {
-  apiKey: "REPLACE_ME",
-  authDomain: "REPLACE_ME",
-  projectId: "REPLACE_ME",
-  storageBucket: "REPLACE_ME",
-  messagingSenderId: "REPLACE_ME",
-  appId: "REPLACE_ME",
+  apiKey: "AIzaSyAogtHc_TIr9Emsv-nRdxeT8KFKYWnwuUc",
+  authDomain: "card-vault-d8fa4.firebaseapp.com",
+  projectId: "card-vault-d8fa4",
+  storageBucket: "card-vault-d8fa4.firebasestorage.app",
+  messagingSenderId: "1007054529380",
+  appId: "1:1007054529380:web:389084401e080bf39ad071",
 };
 
 const FIREBASE_READY = !firebaseConfig.apiKey.startsWith("REPLACE_");
+
+// Keep the mock identify response active even after Firebase is wired.
+// Useful when deploying without an Anthropic API key. Flip to false once you've
+// set the ANTHROPIC_API_KEY secret and deployed the identifyCard Cloud Function.
+const USE_MOCK_AI = false;
 
 let auth, db, storage, functions, currentUser;
 
@@ -69,6 +74,8 @@ if (FIREBASE_READY) {
   document.getElementById("user-chip").textContent = "Demo mode";
 }
 
+const IS_DEMO = !FIREBASE_READY;
+
 // --- State -----------------------------------------------------------------
 const state = {
   frontFile: null,
@@ -78,13 +85,129 @@ const state = {
   editingResult: false,
 };
 
-// Detail-view state holds the loaded card so editing/cancel can re-render
-// without re-fetching.
 const detailState = {
   cardId: null,
   card: null,
   editing: false,
 };
+
+const collectionFilters = {
+  sort: "newest",
+  sport: "all",
+  rookieOnly: false,
+  hofOnly: false,
+  yearFrom: null,
+  yearTo: null,
+};
+
+// --- Sample cards (demo mode only) -----------------------------------------
+// Auto-loaded into the collection when Firebase isn't wired so users can
+// actually exercise search/sort/filter before Phase 2 deploys.
+function makeSampleImg(label) {
+  const svg = `<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 140'>
+    <defs>
+      <linearGradient id='g' x1='0' y1='0' x2='1' y2='0'>
+        <stop offset='0' stop-color='#f59e0b'/>
+        <stop offset='0.5' stop-color='#f43f5e'/>
+        <stop offset='1' stop-color='#6366f1'/>
+      </linearGradient>
+    </defs>
+    <rect width='100' height='140' fill='#0f172a'/>
+    <rect x='5' y='5' width='90' height='130' fill='#020617' stroke='#6366f1' stroke-width='1.5' rx='4'/>
+    <rect x='10' y='10' width='80' height='3' rx='1.5' fill='url(#g)'/>
+    <text x='50' y='75' text-anchor='middle' font-family='Inter, sans-serif' font-size='11' font-weight='800' fill='#e0e7ff'>${label}</text>
+    <text x='50' y='92' text-anchor='middle' font-family='ui-monospace, monospace' font-size='6' fill='#64748b' letter-spacing='1'>SAMPLE</text>
+  </svg>`;
+  return "data:image/svg+xml;utf8," + encodeURIComponent(svg);
+}
+
+// Strip "Jr." / "Sr." / "II" / "III" so the placeholder image label uses the surname.
+function imgLabel(player) {
+  const parts = String(player || "").split(" ");
+  const last = parts[parts.length - 1];
+  if (["Jr.", "Sr.", "II", "III"].includes(last)) return parts[parts.length - 2] || player;
+  return last;
+}
+
+// 50 sample cards across 10 manufacturers and 4 sports, 1933–1990. Tuned so the
+// Manufacturer → Year → Team hierarchy actually shows depth (Topps 1956 alone
+// has cards across 4 teams; Bowman, Goudey, Play Ball, Donruss, Score, Pro Set,
+// Fleer, Upper Deck, and O-Pee-Chee round out the manufacturer dimension).
+// Format: [daysAgo, sport, year, set, player, cardNumber, team, isRookie, isHOF, valueLow, valueHigh, notes?]
+const SAMPLE_RAW = [
+  [1,  "baseball",   1952, "Topps",      "Mickey Mantle",    "311", "Yankees",   false, true,  50000, 150000],
+  [2,  "baseball",   1952, "Topps",      "Willie Mays",      "261", "Giants",    false, true,  3000,  10000],
+  [3,  "baseball",   1952, "Topps",      "Eddie Mathews",    "407", "Braves",    true,  true,  5000,  15000],
+  [4,  "baseball",   1956, "Topps",      "Mickey Mantle",    "135", "Yankees",   false, true,  600,   2500, "From Grandpa's collection"],
+  [5,  "baseball",   1956, "Topps",      "Yogi Berra",       "110", "Yankees",   false, true,  300,   1200],
+  [6,  "baseball",   1956, "Topps",      "Don Larsen",       "410", "Yankees",   false, false, 50,    200],
+  [7,  "baseball",   1956, "Topps",      "Ted Williams",     "5",   "Red Sox",   false, true,  400,   1800],
+  [8,  "baseball",   1956, "Topps",      "Hank Aaron",       "31",  "Braves",    false, true,  300,   1200],
+  [9,  "baseball",   1956, "Topps",      "Willie Mays",      "130", "Giants",    false, true,  400,   1500],
+  [10, "baseball",   1956, "Topps",      "Sandy Koufax",     "79",  "Dodgers",   false, true,  300,   1000],
+  [11, "baseball",   1957, "Topps",      "Mickey Mantle",    "95",  "Yankees",   false, true,  300,   1200],
+  [12, "baseball",   1957, "Topps",      "Brooks Robinson",  "328", "Orioles",   true,  true,  400,   1500],
+  [13, "baseball",   1957, "Topps",      "Don Drysdale",     "18",  "Dodgers",   true,  true,  200,   800],
+  [14, "baseball",   1962, "Topps",      "Roger Maris",      "1",   "Yankees",   false, false, 250,   800],
+  [15, "baseball",   1962, "Topps",      "Mickey Mantle",    "200", "Yankees",   false, true,  200,   700],
+  [16, "baseball",   1962, "Topps",      "Bob Gibson",       "530", "Cardinals", false, true,  150,   500],
+  [17, "baseball",   1968, "Topps",      "Nolan Ryan",       "177", "Mets",      true,  true,  1500,  5000],
+  [18, "baseball",   1968, "Topps",      "Johnny Bench",     "247", "Reds",      true,  true,  500,   2000],
+  [19, "baseball",   1968, "Topps",      "Tom Seaver",       "45",  "Mets",      false, true,  200,   700],
+  [20, "baseball",   1969, "Topps",      "Reggie Jackson",   "260", "A's",       true,  true,  800,   3000],
+  [21, "baseball",   1972, "Topps",      "Carlton Fisk",     "79",  "Red Sox",   true,  true,  100,   400],
+  [22, "baseball",   1973, "Topps",      "Mike Schmidt",     "615", "Phillies",  true,  true,  200,   800],
+  [23, "baseball",   1975, "Topps",      "George Brett",     "228", "Royals",    true,  true,  80,    300],
+  [24, "baseball",   1975, "Topps",      "Robin Yount",      "223", "Brewers",   true,  true,  80,    300],
+  [25, "baseball",   1979, "Topps",      "Ozzie Smith",      "116", "Padres",    true,  true,  80,    300],
+  [26, "baseball",   1979, "Topps",      "Dale Murphy",      "39",  "Braves",    false, false, 5,     25],
+  [27, "baseball",   1980, "Topps",      "Rickey Henderson", "482", "A's",       true,  true,  200,   700],
+  [28, "baseball",   1984, "Topps",      "Don Mattingly",    "8",   "Yankees",   true,  false, 40,    150],
+  [29, "baseball",   1990, "Topps",      "Frank Thomas",     "414", "White Sox", true,  true,  50,    200],
+  [30, "baseball",   1951, "Bowman",     "Mickey Mantle",    "253", "Yankees",   true,  true,  25000, 100000],
+  [31, "basketball", 1948, "Bowman",     "George Mikan",     "69",  "Lakers",    true,  true,  1500,  5000],
+  [32, "baseball",   1933, "Goudey",     "Babe Ruth",        "149", "Yankees",   false, true,  8000,  25000],
+  [33, "baseball",   1933, "Goudey",     "Lou Gehrig",       "92",  "Yankees",   false, true,  5000,  15000],
+  [34, "baseball",   1933, "Goudey",     "Jimmie Foxx",      "154", "A's",       false, true,  1500,  5000],
+  [35, "baseball",   1939, "Play Ball",  "Ted Williams",     "92",  "Red Sox",   true,  true,  5000,  15000],
+  [36, "baseball",   1939, "Play Ball",  "Joe DiMaggio",     "26",  "Yankees",   false, true,  2000,  7000],
+  [37, "baseball",   1989, "Upper Deck", "Ken Griffey Jr.",  "1",   "Mariners",  true,  true,  200,   800],
+  [38, "baseball",   1989, "Upper Deck", "Randy Johnson",    "25",  "Expos",     true,  true,  30,    100],
+  [39, "baseball",   1986, "Donruss",    "Jose Canseco",     "39",  "A's",       true,  false, 20,    80],
+  [40, "hockey",     1979, "O-Pee-Chee", "Wayne Gretzky",    "18",  "Oilers",    true,  true,  8000,  25000],
+  [41, "baseball",   1990, "Score",      "Barry Bonds",      "4",   "Pirates",   false, false, 5,     20],
+  [42, "football",   1957, "Topps",      "Johnny Unitas",    "138", "Colts",     true,  true,  300,   1200],
+  [43, "football",   1965, "Topps",      "Joe Namath",       "122", "Jets",      true,  true,  1500,  5000],
+  [44, "football",   1965, "Topps",      "Gale Sayers",      "155", "Bears",     true,  true,  400,   1500],
+  [45, "football",   1981, "Topps",      "Joe Montana",      "216", "49ers",     true,  true,  200,   800],
+  [46, "football",   1989, "Score",      "Barry Sanders",    "257", "Lions",     true,  true,  40,    150],
+  [47, "football",   1989, "Pro Set",    "Joe Montana",      "294", "49ers",     false, true,  5,     20],
+  [48, "basketball", 1986, "Fleer",      "Michael Jordan",   "57",  "Bulls",     true,  true,  3000,  12000],
+  [49, "basketball", 1986, "Fleer",      "Charles Barkley",  "115", "76ers",     true,  true,  50,    200],
+  [50, "basketball", 1986, "Fleer",      "Hakeem Olajuwon",  "82",  "Rockets",   true,  true,  200,   800],
+];
+
+const SAMPLE_CARDS = SAMPLE_RAW.map((r, i) => {
+  const card = {
+    id: `sample-${i + 1}`,
+    createdAt: { seconds: Math.floor(Date.now() / 1000) - 86400 * r[0] },
+    imageFrontUrl: makeSampleImg(imgLabel(r[4])),
+    identified: {
+      sport: r[1],
+      year: r[2],
+      set: r[3],
+      player: r[4],
+      cardNumber: r[5],
+      team: r[6],
+      isRookie: r[7],
+      isHOF: r[8],
+      confidence: 0.9,
+    },
+    valueEstimate: { low: r[9], high: r[10], note: "Rough sample value." },
+  };
+  if (r[11]) card.userNotes = r[11];
+  return card;
+});
 
 // --- Routing ---------------------------------------------------------------
 function showView(name) {
@@ -173,17 +296,14 @@ identifyBtn.addEventListener("click", async () => {
   }
 });
 
-// Bind result-view notes textarea so user input mirrors into state.
 resultNotesEl.addEventListener("input", (e) => {
   state.notes = e.target.value;
+  refreshResultEbayContent();
 });
 
 // --- Identify --------------------------------------------------------------
-// Real path: shrink images client-side, call the identifyCard Cloud Function.
-// Demo fallback: mock response when Firebase isn't configured yet.
-
 async function identifyCard(frontFile, backFile) {
-  if (!FIREBASE_READY || !currentUser) {
+  if (USE_MOCK_AI || !FIREBASE_READY || !currentUser) {
     return mockIdentify();
   }
   const frontImageBase64 = await fileToShrunkBase64(frontFile);
@@ -202,6 +322,7 @@ async function mockIdentify() {
       set: "Topps",
       player: "Mickey Mantle",
       cardNumber: "135",
+      team: "Yankees",
       isRookie: false,
       isHOF: true,
       confidence: 0.82,
@@ -215,8 +336,6 @@ async function mockIdentify() {
   };
 }
 
-// Resize to 1280px on the longest side + JPEG @ 0.85 before base64 encoding.
-// Keeps OpenAI Vision payloads small without hurting card OCR quality.
 async function fileToShrunkBase64(file, maxDim = 1280) {
   const dataUrl = await new Promise((resolve, reject) => {
     const reader = new FileReader();
@@ -267,6 +386,7 @@ function renderResult(data) {
       <div class="note">${esc(valueEstimate?.note || "")}</div>
     </div>
     <button id="edit-details-btn" class="link-button" style="margin-top: 10px;">Edit details</button>
+    ${ebaySectionHTML({ ...data, userNotes: state.notes })}
   `;
 
   document.getElementById("edit-details-btn").addEventListener("click", () => {
@@ -300,7 +420,6 @@ function renderResultEditForm() {
   });
 }
 
-// Shared form markup — caller is responsible for the apply/cancel buttons.
 function renderEditFormHTML(identified) {
   const sports = ["baseball", "football", "basketball", "hockey", "other"];
   return `
@@ -317,6 +436,9 @@ function renderEditFormHTML(identified) {
       </label>
       <label>Card number
         <input id="ed-cardNumber" type="text" value="${esc(identified.cardNumber || "")}" autocomplete="off" />
+      </label>
+      <label>Team
+        <input id="ed-team" type="text" value="${esc(identified.team || "")}" placeholder="e.g. Yankees, Bulls (optional)" autocomplete="off" />
       </label>
       <label>Sport
         <select id="ed-sport">
@@ -347,6 +469,7 @@ function readEditFormValues() {
     year: Number.isFinite(yearRaw) ? yearRaw : null,
     set: document.getElementById("ed-set").value.trim(),
     cardNumber: document.getElementById("ed-cardNumber").value.trim(),
+    team: document.getElementById("ed-team").value.trim() || null,
     sport: document.getElementById("ed-sport").value,
     isRookie: document.getElementById("ed-isRookie").checked,
     isHOF: document.getElementById("ed-isHOF").checked,
@@ -416,15 +539,23 @@ const collectionListEl = document.getElementById("collection-list");
 const collectionEmptyEl = document.getElementById("collection-empty");
 const collectionTotalEl = document.getElementById("collection-total");
 const collectionSearchEl = document.getElementById("collection-search");
+const sortSelectEl = document.getElementById("collection-sort");
+const filtersToggleEl = document.getElementById("filters-toggle");
+const filtersPanelEl = document.getElementById("filters-panel");
+const filterSportEl = document.getElementById("filter-sport");
+const filterRookieEl = document.getElementById("filter-rookie");
+const filterHofEl = document.getElementById("filter-hof");
+const filterYearFromEl = document.getElementById("filter-year-from");
+const filterYearToEl = document.getElementById("filter-year-to");
+const filtersClearEl = document.getElementById("filters-clear");
+const exportCsvEl = document.getElementById("export-csv");
 
 let cardsCache = [];
 
 async function renderCollection() {
-  if (!FIREBASE_READY || !currentUser) {
-    collectionListEl.innerHTML = "";
-    collectionEmptyEl.innerHTML = `<p>Firebase not connected yet (demo mode).</p>`;
-    collectionEmptyEl.hidden = false;
-    collectionTotalEl.textContent = "";
+  if (IS_DEMO || !currentUser) {
+    cardsCache = SAMPLE_CARDS.slice();
+    drawCollection();
     return;
   }
   const snap = await getDocs(
@@ -434,14 +565,49 @@ async function renderCollection() {
   drawCollection();
 }
 
-function drawCollection() {
+const sortComparators = {
+  newest: (a, b) => tsMs(b.createdAt) - tsMs(a.createdAt),
+  oldest: (a, b) => tsMs(a.createdAt) - tsMs(b.createdAt),
+  "highest-value": (a, b) => (b.valueEstimate?.high || 0) - (a.valueEstimate?.high || 0),
+  "lowest-value": (a, b) => (a.valueEstimate?.low || 0) - (b.valueEstimate?.low || 0),
+  "newest-cards": (a, b) => (b.identified?.year || 0) - (a.identified?.year || 0),
+  "oldest-cards": (a, b) => (a.identified?.year || 9999) - (b.identified?.year || 9999),
+  "player-az": (a, b) => (a.identified?.player || "").localeCompare(b.identified?.player || ""),
+};
+
+function applyFiltersAndSort(cards) {
   const term = (collectionSearchEl.value || "").trim().toLowerCase();
-  const filtered = term
-    ? cardsCache.filter((c) => {
-        const haystack = `${c.identified?.player || ""} ${c.identified?.year || ""} ${c.identified?.set || ""}`.toLowerCase();
-        return haystack.includes(term);
-      })
-    : cardsCache;
+  const f = collectionFilters;
+  const filtered = cards.filter((c) => {
+    if (term) {
+      const haystack = `${c.identified?.player || ""} ${c.identified?.year || ""} ${c.identified?.set || ""} ${c.identified?.team || ""}`.toLowerCase();
+      if (!haystack.includes(term)) return false;
+    }
+    if (f.sport !== "all" && c.identified?.sport !== f.sport) return false;
+    if (f.rookieOnly && !c.identified?.isRookie) return false;
+    if (f.hofOnly && !c.identified?.isHOF) return false;
+    const y = c.identified?.year;
+    if (f.yearFrom !== null && (typeof y !== "number" || y < f.yearFrom)) return false;
+    if (f.yearTo !== null && (typeof y !== "number" || y > f.yearTo)) return false;
+    return true;
+  });
+  const cmp = sortComparators[f.sort] || sortComparators.newest;
+  return filtered.slice().sort(cmp);
+}
+
+function drawCollection() {
+  const filtered = applyFiltersAndSort(cardsCache);
+  ensureDemoBanner();
+
+  const totalLow = cardsCache.reduce((s, c) => s + (c.valueEstimate?.low || 0), 0);
+  const totalHigh = cardsCache.reduce((s, c) => s + (c.valueEstimate?.high || 0), 0);
+  if (cardsCache.length === 0) {
+    collectionTotalEl.textContent = "";
+  } else if (filtered.length === cardsCache.length) {
+    collectionTotalEl.textContent = `${cardsCache.length} cards • $${fmt(totalLow)}–$${fmt(totalHigh)} est.`;
+  } else {
+    collectionTotalEl.textContent = `${filtered.length} of ${cardsCache.length} cards`;
+  }
 
   if (cardsCache.length === 0) {
     collectionEmptyEl.innerHTML = `
@@ -450,44 +616,246 @@ function drawCollection() {
     `;
     collectionEmptyEl.hidden = false;
   } else if (filtered.length === 0) {
-    collectionEmptyEl.innerHTML = `<p>No cards match &ldquo;${esc(term)}&rdquo;.</p>`;
+    collectionEmptyEl.innerHTML = `
+      <p>No cards match those filters.</p>
+      <button id="empty-clear" type="button" class="link-button">Clear all filters</button>
+    `;
     collectionEmptyEl.hidden = false;
+    document.getElementById("empty-clear").addEventListener("click", clearAllFilters);
   } else {
     collectionEmptyEl.hidden = true;
   }
 
-  const totalLow = cardsCache.reduce((s, c) => s + (c.valueEstimate?.low || 0), 0);
-  const totalHigh = cardsCache.reduce((s, c) => s + (c.valueEstimate?.high || 0), 0);
-  collectionTotalEl.textContent = cardsCache.length
-    ? `${cardsCache.length} cards • $${fmt(totalLow)}–$${fmt(totalHigh)} est.`
-    : "";
+  collectionListEl.innerHTML = renderGroupedHTML(filtered);
+}
 
-  collectionListEl.innerHTML = filtered
-    .map(
-      (c) => `
-      <a class="collection-card" href="#/detail/${c.id}">
-        <img src="${esc(c.imageFrontUrl || "")}" alt="${esc(c.identified?.player || "Card")}" />
-        <div class="info">
-          <div class="name">${esc(c.identified?.player || "Unknown")}</div>
-          <div class="sub">${esc(c.identified?.year || "")} ${esc(c.identified?.set || "")}</div>
-          <div class="price">$${fmt(c.valueEstimate?.low || 0)}–$${fmt(c.valueEstimate?.high || 0)}</div>
-        </div>
-      </a>`,
-    )
+// Hierarchical Manufacturer → Year → Team grouping.
+// Cards within each leaf are kept in the order applyFiltersAndSort returned,
+// and group keys are iterated in insertion order — so the chosen sort
+// cascades naturally through every level (manufacturers / years / teams all
+// re-order based on their highest-ranked card under the active sort).
+function renderGroupedHTML(cards) {
+  if (cards.length === 0) return "";
+
+  const groups = new Map();
+  for (const c of cards) {
+    const mfr = (c.identified?.set || "").trim() || "(Unknown manufacturer)";
+    const year = c.identified?.year || "(Unknown year)";
+    const team = (c.identified?.team || "").trim() || "(Unknown team)";
+    if (!groups.has(mfr)) groups.set(mfr, new Map());
+    const mfrMap = groups.get(mfr);
+    if (!mfrMap.has(year)) mfrMap.set(year, new Map());
+    const yearMap = mfrMap.get(year);
+    if (!yearMap.has(team)) yearMap.set(team, []);
+    yearMap.get(team).push(c);
+  }
+
+  const mfrs = [...groups.keys()];
+  return mfrs
+    .map((mfr) => {
+      const mfrMap = groups.get(mfr);
+      const years = [...mfrMap.keys()];
+      const mfrCount = years.reduce(
+        (sum, y) => sum + [...mfrMap.get(y).values()].reduce((s, arr) => s + arr.length, 0),
+        0,
+      );
+      return `
+        <details class="group group-mfr" open>
+          <summary class="group-summary">
+            <span class="group-name">${esc(mfr)}</span>
+            <span class="group-count">${mfrCount}</span>
+          </summary>
+          ${years
+            .map((year) => {
+              const yearMap = mfrMap.get(year);
+              const teams = [...yearMap.keys()];
+              const yearCount = [...yearMap.values()].reduce((s, arr) => s + arr.length, 0);
+              return `
+                <details class="group group-year" open>
+                  <summary class="group-summary">
+                    <span class="group-name">${esc(year)}</span>
+                    <span class="group-count">${yearCount}</span>
+                  </summary>
+                  ${teams
+                    .map((team) => {
+                      const teamCards = yearMap.get(team);
+                      return `
+                        <details class="group group-team" open>
+                          <summary class="group-summary">
+                            <span class="group-name">${esc(team)}</span>
+                            <span class="group-count">${teamCards.length}</span>
+                          </summary>
+                          <div class="group-cards">
+                            ${teamCards
+                              .map(
+                                (c) => `
+                              <a class="collection-card" href="#/detail/${esc(c.id)}">
+                                <img src="${esc(c.imageFrontUrl || "")}" alt="${esc(c.identified?.player || "Card")}" />
+                                <div class="info">
+                                  <div class="name">${esc(c.identified?.player || "Unknown")}</div>
+                                  <div class="sub">${c.identified?.cardNumber ? `#${esc(c.identified.cardNumber)}` : ""}</div>
+                                  <div class="price">$${fmt(c.valueEstimate?.low || 0)}–$${fmt(c.valueEstimate?.high || 0)}</div>
+                                </div>
+                              </a>`,
+                              )
+                              .join("")}
+                          </div>
+                        </details>`;
+                    })
+                    .join("")}
+                </details>`;
+            })
+            .join("")}
+        </details>`;
+    })
     .join("");
 }
 
+function ensureDemoBanner() {
+  const existing = document.getElementById("demo-banner");
+  if (IS_DEMO) {
+    if (!existing) {
+      const banner = document.createElement("div");
+      banner.id = "demo-banner";
+      banner.className = "demo-banner";
+      banner.innerHTML =
+        "Showing <strong>sample cards</strong> so you can try search and filters. Your real saved cards will appear here once Firebase is connected.";
+      collectionListEl.parentNode.insertBefore(banner, collectionListEl);
+    }
+  } else if (existing) {
+    existing.remove();
+  }
+}
+
+function clearAllFilters() {
+  collectionFilters.sport = "all";
+  collectionFilters.rookieOnly = false;
+  collectionFilters.hofOnly = false;
+  collectionFilters.yearFrom = null;
+  collectionFilters.yearTo = null;
+  filterSportEl.value = "all";
+  filterRookieEl.checked = false;
+  filterHofEl.checked = false;
+  filterYearFromEl.value = "";
+  filterYearToEl.value = "";
+  drawCollection();
+}
+
+// Collection control wiring
 collectionSearchEl.addEventListener("input", drawCollection);
+
+sortSelectEl.addEventListener("change", () => {
+  collectionFilters.sort = sortSelectEl.value;
+  drawCollection();
+});
+
+filtersToggleEl.addEventListener("click", () => {
+  filtersPanelEl.hidden = !filtersPanelEl.hidden;
+  filtersToggleEl.classList.toggle("active", !filtersPanelEl.hidden);
+});
+
+filterSportEl.addEventListener("change", () => {
+  collectionFilters.sport = filterSportEl.value;
+  drawCollection();
+});
+filterRookieEl.addEventListener("change", () => {
+  collectionFilters.rookieOnly = filterRookieEl.checked;
+  drawCollection();
+});
+filterHofEl.addEventListener("change", () => {
+  collectionFilters.hofOnly = filterHofEl.checked;
+  drawCollection();
+});
+filterYearFromEl.addEventListener("input", () => {
+  const v = parseInt(filterYearFromEl.value, 10);
+  collectionFilters.yearFrom = Number.isFinite(v) ? v : null;
+  drawCollection();
+});
+filterYearToEl.addEventListener("input", () => {
+  const v = parseInt(filterYearToEl.value, 10);
+  collectionFilters.yearTo = Number.isFinite(v) ? v : null;
+  drawCollection();
+});
+filtersClearEl.addEventListener("click", clearAllFilters);
+
+exportCsvEl.addEventListener("click", () => {
+  const filtered = applyFiltersAndSort(cardsCache);
+  if (filtered.length === 0) {
+    alert("Nothing to export. Try clearing your filters.");
+    return;
+  }
+  exportCSV(filtered);
+});
+
+// --- CSV export ------------------------------------------------------------
+function exportCSV(cards) {
+  const headers = ["Player", "Year", "Set", "Card #", "Sport", "Rookie", "HOF", "Value Low", "Value High", "Notes", "Date Added"];
+  const rows = cards.map((c) => [
+    c.identified?.player || "",
+    c.identified?.year || "",
+    c.identified?.set || "",
+    c.identified?.cardNumber || "",
+    c.identified?.sport || "",
+    c.identified?.isRookie ? "Yes" : "",
+    c.identified?.isHOF ? "Yes" : "",
+    c.valueEstimate?.low || "",
+    c.valueEstimate?.high || "",
+    (c.userNotes || "").replace(/\r?\n/g, " "),
+    formatDate(c.createdAt),
+  ]);
+  const csv = [headers, ...rows].map((row) => row.map(csvEscape).join(",")).join("\r\n");
+  const blob = new Blob(["﻿" + csv], { type: "text/csv;charset=utf-8;" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = `card-vault-${new Date().toISOString().split("T")[0]}.csv`;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
+function csvEscape(v) {
+  const s = String(v ?? "");
+  return /[",\r\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+}
+
+function tsMs(ts) {
+  if (!ts) return 0;
+  if (typeof ts.toMillis === "function") return ts.toMillis();
+  if (typeof ts.seconds === "number") return ts.seconds * 1000;
+  if (typeof ts === "number") return ts;
+  return 0;
+}
+
+function formatDate(ts) {
+  const ms = tsMs(ts);
+  if (!ms) return "";
+  return new Date(ms).toISOString().split("T")[0];
+}
 
 // --- Detail view -----------------------------------------------------------
 async function renderDetail(cardId) {
   const el = document.getElementById("detail-content");
-  if (!FIREBASE_READY || !currentUser) {
-    el.innerHTML = `<p class="muted">Firebase not connected yet (demo mode).</p>`;
+
+  if (IS_DEMO) {
+    const sample = (cardsCache.length ? cardsCache : SAMPLE_CARDS).find((c) => c.id === cardId);
+    if (!sample) {
+      el.innerHTML = `<p class="muted">Card not found.</p>`;
+      return;
+    }
+    detailState.cardId = cardId;
+    detailState.card = sample;
+    detailState.editing = false;
+    renderDetailDisplay(el);
     return;
   }
 
-  // Cache the loaded card so editing flow can re-render without re-fetching.
+  if (!currentUser) {
+    el.innerHTML = `<p class="muted">Signing in...</p>`;
+    return;
+  }
+
   if (detailState.cardId !== cardId || !detailState.card) {
     el.innerHTML = `<p class="muted">Loading...</p>`;
     const snap = await getDoc(doc(db, "users", currentUser.uid, "cards", cardId));
@@ -513,6 +881,7 @@ function renderDetailDisplay(el) {
   const uncertain = (c.identified?.confidence || 0) < 0.5 && !c.identified?.userEdited;
 
   el.innerHTML = `
+    ${IS_DEMO ? `<div class="demo-banner">This is a <strong>sample card</strong>. Editing and deleting are disabled in demo mode.</div>` : ""}
     ${highValue ? `<div class="high-value-banner">This may be a valuable card. Get a professional appraisal before selling.</div>` : ""}
     ${uncertain ? `<div class="uncertain-banner">The AI wasn't very sure about this one. Tap <strong>Edit details</strong> to correct anything.</div>` : ""}
     <div class="result-card">
@@ -530,31 +899,32 @@ function renderDetailDisplay(el) {
       </div>
     </div>
     ${c.userNotes ? `<div class="notes-display">${esc(c.userNotes)}</div>` : ""}
-    <div class="row">
-      <button id="detail-edit-btn" class="big-button">Edit details &amp; notes</button>
-    </div>
+    ${ebaySectionHTML(c)}
+    ${IS_DEMO ? "" : `<div class="row"><button id="detail-edit-btn" class="big-button">Edit details &amp; notes</button></div>`}
     ${c.imageFrontUrl ? `<img src="${esc(c.imageFrontUrl)}" alt="Front" />` : ""}
     ${c.imageBackUrl ? `<img src="${esc(c.imageBackUrl)}" alt="Back" />` : ""}
-    <button id="delete-btn" class="big-button" style="color:var(--danger);">Remove from collection</button>
+    ${IS_DEMO ? "" : `<button id="delete-btn" class="big-button" style="color:var(--danger);">Remove from collection</button>`}
   `;
 
-  document.getElementById("detail-edit-btn").addEventListener("click", () => {
-    detailState.editing = true;
-    renderDetail(detailState.cardId);
-  });
-  document.getElementById("delete-btn").addEventListener("click", async () => {
-    if (!confirm("Remove this card from your collection?")) return;
-    try {
-      await deleteDoc(doc(db, "users", currentUser.uid, "cards", detailState.cardId));
-      detailState.cardId = null;
-      detailState.card = null;
-      detailState.editing = false;
-      location.hash = "#/collection";
-    } catch (err) {
-      console.error(err);
-      alert("Couldn't remove. Try again.");
-    }
-  });
+  if (!IS_DEMO) {
+    document.getElementById("detail-edit-btn").addEventListener("click", () => {
+      detailState.editing = true;
+      renderDetail(detailState.cardId);
+    });
+    document.getElementById("delete-btn").addEventListener("click", async () => {
+      if (!confirm("Remove this card from your collection?")) return;
+      try {
+        await deleteDoc(doc(db, "users", currentUser.uid, "cards", detailState.cardId));
+        detailState.cardId = null;
+        detailState.card = null;
+        detailState.editing = false;
+        location.hash = "#/collection";
+      } catch (err) {
+        console.error(err);
+        alert("Couldn't remove. Try again.");
+      }
+    });
+  }
 }
 
 function renderDetailEditing(el) {
@@ -615,6 +985,160 @@ function esc(s) {
 function fmt(n) {
   return Number(n || 0).toLocaleString("en-US");
 }
+
+function escAttr(s) {
+  return String(s ?? "").replace(/[^a-zA-Z0-9_-]/g, "-");
+}
+
+function capSport(s) {
+  if (!s) return "";
+  return s[0].toUpperCase() + s.slice(1);
+}
+
+// --- eBay listing generator ------------------------------------------------
+function ebayTitle(c) {
+  const id = c.identified || {};
+  const parts = [];
+  if (id.year) parts.push(String(id.year));
+  if (id.set) parts.push(id.set);
+  if (id.player) parts.push(id.player);
+  if (id.cardNumber) parts.push(`#${id.cardNumber}`);
+  if (id.team) parts.push(id.team);
+  if (id.sport) parts.push(capSport(id.sport));
+  if (id.isRookie) parts.push("ROOKIE RC");
+  if (id.isHOF) parts.push("HOF");
+  let title = parts.join(" ").trim();
+  if (!title) title = "Sports card";
+  if (title.length > 80) title = title.slice(0, 77).trimEnd() + "...";
+  return title;
+}
+
+function ebayDescription(c) {
+  const id = c.identified || {};
+  const val = c.valueEstimate || {};
+  const lines = [];
+
+  const header = [id.year, id.set, id.player].filter(Boolean).join(" ");
+  if (header) lines.push(header);
+
+  const meta = [];
+  if (id.cardNumber) meta.push(`Card #${id.cardNumber}`);
+  if (id.team) meta.push(id.team);
+  if (id.sport) meta.push(capSport(id.sport));
+  if (meta.length) lines.push(meta.join(" • "));
+  lines.push("");
+
+  const highlights = [];
+  if (id.isRookie) highlights.push("Rookie card (RC)");
+  if (id.isHOF) highlights.push("Hall of Fame player");
+  if (typeof id.year === "number") {
+    if (id.year < 1946) highlights.push("Pre-war vintage");
+    else if (id.year <= 1980) highlights.push("Vintage");
+  }
+  if (highlights.length) {
+    lines.push("Highlights:");
+    for (const h of highlights) lines.push(`- ${h}`);
+    lines.push("");
+  }
+
+  lines.push("CONDITION:");
+  lines.push(
+    "This card has NOT been professionally graded. Please review all photos carefully to assess condition before bidding. Sold as-is from a personal collection.",
+  );
+  lines.push("");
+
+  if (val.low || val.high) {
+    lines.push(
+      `Reference value range (rough estimate): $${fmt(val.low || 0)} - $${fmt(val.high || 0)}. Verify against recent eBay "Sold" listings before bidding.`,
+    );
+    lines.push("");
+  }
+
+  if (c.userNotes) {
+    lines.push(`Seller notes: ${c.userNotes}`);
+    lines.push("");
+  }
+
+  lines.push("Combined shipping available on multiple-card purchases. Message with any questions before bidding.");
+
+  return lines.join("\n").trim();
+}
+
+function ebaySectionHTML(c) {
+  const title = ebayTitle(c);
+  const desc = ebayDescription(c);
+  const slug = escAttr(c.id || "result");
+  return `
+    <details class="ebay-section">
+      <summary>Generate eBay listing</summary>
+      <div class="ebay-content">
+        <div class="ebay-field">
+          <div class="ebay-field-label">
+            <span>Title</span>
+            <span class="ebay-field-hint">${title.length}/80 chars</span>
+          </div>
+          <input type="text" id="ebay-title-${slug}" readonly value="${esc(title)}" />
+          <button class="copy-btn" data-copy-target="#ebay-title-${slug}">Copy title</button>
+        </div>
+        <div class="ebay-field">
+          <div class="ebay-field-label"><span>Description</span></div>
+          <textarea id="ebay-desc-${slug}" readonly>${esc(desc)}</textarea>
+          <button class="copy-btn" data-copy-target="#ebay-desc-${slug}">Copy description</button>
+        </div>
+      </div>
+    </details>
+  `;
+}
+
+async function copyToClipboard(text, btn) {
+  let ok = false;
+  try {
+    await navigator.clipboard.writeText(text);
+    ok = true;
+  } catch {
+    // Fallback for non-secure contexts
+    const ta = document.createElement("textarea");
+    ta.value = text;
+    ta.style.position = "fixed";
+    ta.style.opacity = "0";
+    document.body.appendChild(ta);
+    ta.select();
+    try {
+      ok = document.execCommand("copy");
+    } catch {}
+    document.body.removeChild(ta);
+  }
+  const original = btn.dataset.originalLabel || btn.textContent;
+  btn.dataset.originalLabel = original;
+  btn.textContent = ok ? "Copied!" : "Press Ctrl+C";
+  btn.classList.toggle("copied", ok);
+  setTimeout(() => {
+    btn.textContent = original;
+    btn.classList.remove("copied");
+  }, 1500);
+}
+
+// Refresh just the inner content of the result-view eBay section so live
+// edits to the notes textarea (or the inline edit form) reflect immediately.
+function refreshResultEbayContent() {
+  if (!state.lastIdentified) return;
+  const existing = document.querySelector("#result-card .ebay-section .ebay-content");
+  if (!existing) return;
+  const cardData = { ...state.lastIdentified, userNotes: state.notes };
+  const wrapper = document.createElement("div");
+  wrapper.innerHTML = ebaySectionHTML(cardData);
+  const newContent = wrapper.querySelector(".ebay-content");
+  if (newContent) existing.innerHTML = newContent.innerHTML;
+}
+
+// Event delegation for all copy buttons (result view + detail view).
+document.addEventListener("click", async (e) => {
+  const btn = e.target.closest(".copy-btn");
+  if (!btn) return;
+  const target = document.querySelector(btn.dataset.copyTarget);
+  if (!target) return;
+  await copyToClipboard(target.value, btn);
+});
 
 // --- Boot ------------------------------------------------------------------
 route();

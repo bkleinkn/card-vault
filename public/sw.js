@@ -1,7 +1,7 @@
 // Minimal service worker — keeps PWA install criteria happy.
 // Cache strategy stays trivially simple until offline becomes a real need.
 
-const CACHE = "card-vault-v1";
+const CACHE = "card-vault-v2";
 const ASSETS = ["./", "index.html", "app.css", "app.js", "manifest.json"];
 
 self.addEventListener("install", (event) => {

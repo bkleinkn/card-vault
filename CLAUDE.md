@@ -19,7 +19,7 @@ If a feature requires collector jargon to use, it doesn't belong in v1.
 - **Auth:** Firebase Anonymous Auth (frictionless for older users; upgradeable to email later)
 - **Database:** Firestore
 - **Image storage:** Firebase Cloud Storage
-- **AI vision:** OpenAI Vision API (via a Cloud Function so the key never ships to the client)
+- **AI vision:** Claude Opus 4.7 via the Anthropic SDK (called from a Cloud Function so the key never ships to the client). Adaptive thinking + `output_config.format` json_schema for guaranteed structured output + ephemeral prompt caching on `IDENTIFY_PROMPT` (~90% cost reduction after the first scan).
 - **Pricing:** AI rough-estimate first; real eBay sold comps later (see Pricing strategy)
 
 ## MVP scope
@@ -55,7 +55,7 @@ eBay's public sold-listings API was deprecated. Real options:
 
 - **eBay Marketplace Insights API** — 90 days of sold data, but requires approval (slow)
 - **PriceCharting / Card Ladder / 130point** — paid APIs
-- **MVP:** ask OpenAI Vision for a rough range from training knowledge; label it loudly as a rough estimate; integrate real comp data in v2 once the scan-identify-save loop is proven
+- **MVP:** ask Claude for a rough range from training knowledge; label it loudly as a rough estimate; integrate real comp data in v2 once the scan-identify-save loop is proven
 
 ### Card database
 
@@ -93,12 +93,14 @@ users/{uid}/cards/{cardId}
   identified: {
     sport          // "baseball"
     year           // 1952
-    set            // "Topps"
+    set            // "Topps"          ← grouped as "Manufacturer" in UI
     player         // "Mickey Mantle"
     cardNumber     // "311"
+    team           // "Yankees" (nullable for non-team sports)
     isRookie       // boolean
     isHOF          // boolean
     confidence     // 0-1
+    userEdited?    // true if user corrected AI's guess
   }
   valueEstimate: {
     low            // dollars
@@ -109,6 +111,8 @@ users/{uid}/cards/{cardId}
   userNotes?       // free text
   conditionGuess?  // user-entered string for v1; AI-graded later
 ```
+
+The collection view groups cards as **Manufacturer (set) → Year → Team** via nested `<details>` elements — the primary browse pattern for working through an inherited collection. Search / sort / sport / Rookie / HOF / year-range filters narrow the cards that get bucketed into the groups.
 
 ## File layout
 
@@ -144,9 +148,9 @@ card-vault/
 
 **Phase 1 (scan + identify locally) — DONE + EXPANDED.** Camera capture, mock identify response, full result view. Beyond original scope: generated PWA icons (192/512/maskable), About page with plain-language disclaimers, inline edit-details flow (Player/Year/Set/#/Sport/Rookie/HOF), user notes field, confidence-aware copy (soft "I'm not sure" banner under 50% confidence), and empty-state CTA on collection.
 
-**Phase 2 (real AI) — BLOCKED on Firebase project quota approval.** User requested quota increase from Google on 2026-05-27 (was at 19 of ~20 projects). Once approved: paste firebaseConfig + OpenAI key, `firebase functions:secrets:set OPENAI_API_KEY`, `firebase deploy`. Cloud Function code (`functions/index.js`) is ready and the client (`public/app.js`) already routes through `httpsCallable("identifyCard")` when Firebase is wired.
+**Phase 2 (real AI) — DONE.** LIVE at **`https://card-vault-d8fa4.web.app`**. Firebase project `card-vault-d8fa4` is parented under the `bkleinkn-org` Google Cloud Organization (note: doesn't show in the default Firebase Console projects list — bookmark the direct URL). Cloud Function `identifyCard` deployed to `us-central1` reading `ANTHROPIC_API_KEY` from Firebase Secrets Manager. Client `USE_MOCK_AI = false` flag flipped — real scans hit Claude Opus 4.7. Build IAM roles (`cloudbuild.builds.builder`, `artifactregistry.writer`, `logging.logWriter`) granted to the default Compute Engine service account once; future deploys work without re-granting.
 
-**Phase 3 (collection) — CODED, awaiting live test.** Firestore CRUD, list view, detail view with edit flow, delete, search — all in `public/app.js`. Just needs the Phase 2 deploy to exercise.
+**Phase 3 (collection) — DONE.** Firestore CRUD, list view, detail view with edit flow, delete, search — all live and exercised via the deployed app.
 
 **Phase 4 (polish)** — High-value flagging, totals, edit flow, notes, confidence-aware copy: DONE. Basic CSV export still pending.
 

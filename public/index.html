@@ -3,14 +3,18 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
-  <meta name="theme-color" content="#0b3d2e" />
+  <meta name="theme-color" content="#020617" />
   <title>Card Vault</title>
   <link rel="manifest" href="manifest.json" />
   <link rel="icon" href="icons/icon-192.png" />
   <link rel="apple-touch-icon" href="icons/icon-192.png" />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@500;700&display=swap" />
   <link rel="stylesheet" href="app.css" />
 </head>
 <body>
+  <div class="top-strip" aria-hidden="true"></div>
   <header class="topbar">
     <h1>Card Vault</h1>
     <div class="topbar-right">
@@ -65,6 +69,52 @@
         <p id="collection-total" class="muted"></p>
       </div>
       <input id="collection-search" type="search" placeholder="Search player, year, set..." class="search-input" />
+      <div class="collection-controls">
+        <select id="collection-sort" class="control-select" aria-label="Sort">
+          <option value="newest">Newest first</option>
+          <option value="oldest">Oldest first</option>
+          <option value="highest-value">Highest value</option>
+          <option value="lowest-value">Lowest value</option>
+          <option value="newest-cards">Newest cards (year)</option>
+          <option value="oldest-cards">Oldest cards (year)</option>
+          <option value="player-az">Player A&ndash;Z</option>
+        </select>
+        <button id="filters-toggle" type="button" class="control-btn">Filters</button>
+        <button id="export-csv" type="button" class="control-btn">Export CSV</button>
+      </div>
+      <div id="filters-panel" class="filters-panel" hidden>
+        <div class="filters-row">
+          <label class="filter-field">Sport
+            <select id="filter-sport">
+              <option value="all">All sports</option>
+              <option value="baseball">Baseball</option>
+              <option value="football">Football</option>
+              <option value="basketball">Basketball</option>
+              <option value="hockey">Hockey</option>
+              <option value="other">Other</option>
+            </select>
+          </label>
+        </div>
+        <div class="filter-chips">
+          <label class="chip-toggle">
+            <input type="checkbox" id="filter-rookie" />
+            <span>Rookies only</span>
+          </label>
+          <label class="chip-toggle">
+            <input type="checkbox" id="filter-hof" />
+            <span>Hall of Famers only</span>
+          </label>
+        </div>
+        <div class="filters-row year-range">
+          <label class="filter-field">From year
+            <input id="filter-year-from" type="number" min="1880" max="2030" placeholder="any" inputmode="numeric" />
+          </label>
+          <label class="filter-field">To year
+            <input id="filter-year-to" type="number" min="1880" max="2030" placeholder="any" inputmode="numeric" />
+          </label>
+        </div>
+        <button id="filters-clear" type="button" class="link-button">Clear all filters</button>
+      </div>
       <div id="collection-list" class="collection-list"></div>
       <div id="collection-empty" class="empty-state" hidden></div>
     </section>
