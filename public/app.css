@@ -320,7 +320,7 @@ p { color: var(--ink-soft); margin: 8px 0; }
   letter-spacing: 0.02em;
 }
 
-/* ---------- Live camera autoscan ---------- */
+/* ---------- Live camera ---------- */
 .camera-stage {
   position: relative;
   width: 100%;
@@ -352,11 +352,6 @@ p { color: var(--ink-soft); margin: 8px 0; }
   pointer-events: none;
 }
 
-.camera-stage.is-ready .camera-guide {
-  border-color: var(--success-text);
-  box-shadow: 0 0 0 100vmax rgba(2, 6, 23, 0.18), 0 0 18px rgba(52, 211, 153, 0.5);
-}
-
 .camera-hint {
   position: absolute;
   left: 50%;
@@ -374,22 +369,6 @@ p { color: var(--ink-soft); margin: 8px 0; }
   border-radius: var(--radius-pill);
   backdrop-filter: blur(4px);
   pointer-events: none;
-}
-
-.autoscan-track {
-  position: absolute;
-  left: 0;
-  right: 0;
-  bottom: 0;
-  height: 4px;
-  background: rgba(199, 210, 254, 0.12);
-}
-
-.autoscan-fill {
-  height: 100%;
-  width: 0%;
-  background: linear-gradient(90deg, var(--accent), var(--accent-soft));
-  transition: width 0.12s linear;
 }
 
 .camera-fallback { margin: 6px 0 0; }

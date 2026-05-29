@@ -226,7 +226,6 @@ function route() {
 
   if (hash.startsWith("#/scan")) {
     showView("scan");
-    autoCaptureSuspended = false;
     showCameraStart();
   } else if (hash.startsWith("#/collection")) {
     showView("collection");
@@ -243,7 +242,6 @@ function route() {
     showView("guide");
   } else {
     showView("scan");
-    autoCaptureSuspended = false;
     showCameraStart();
   }
 }
@@ -321,33 +319,19 @@ async function runIdentify() {
 }
 
 // --- Autoscan camera -------------------------------------------------------
-// Live camera with hands-free capture: when the frame is sharp (in focus) and
-// the phone is held steady for a beat, we grab a full-res frame and identify it
-// automatically — no shutter tap. Falls back to file upload when the camera is
+// Live camera with a MANUAL shutter. The camera opens only when the user taps
+// "Open camera," and a frame is grabbed only when they tap "Capture" — there is
+// no automatic capture. Falls back to file upload when the camera is
 // unavailable or permission is denied.
 const cameraStage = document.getElementById("camera-stage");
 const cameraVideo = document.getElementById("camera-video");
 const cameraHint = document.getElementById("camera-hint");
-const autoscanFill = document.getElementById("autoscan-fill");
 const captureNowBtn = document.getElementById("capture-now-btn");
 const enableCameraBtn = document.getElementById("enable-camera-btn");
 const cameraFallback = document.getElementById("camera-fallback");
 
-// Tunables — adjust by feel on-device.
-const ANALYZE_W = 192;        // downscaled width for the focus/stability math
-const ANALYZE_INTERVAL = 140; // ms between frame analyses
-const STABLE_DIFF = 4.2;      // mean per-pixel gray delta below this = "steady"
-const SHARP_MIN = 22;         // variance-of-Laplacian floor = "in focus"
-const READY_FRAMES = 5;       // consecutive good frames before auto-capture
-
 let cameraStream = null;
-let analyzeTimer = null;
-let prevGray = null;
-let steadyCount = 0;
 let capturing = false;          // guards against double-capture mid-identify
-let autoCaptureSuspended = false; // true after a failed identify (manual retry)
-const analyzeCanvas = document.createElement("canvas");
-const analyzeCtx = analyzeCanvas.getContext("2d", { willReadFrequently: true });
 
 function camSupported() {
   return !!(navigator.mediaDevices && navigator.mediaDevices.getUserMedia);
@@ -356,10 +340,6 @@ function camSupported() {
 function setHint(text) {
   cameraHint.textContent = text;
   cameraHint.hidden = !text;
-}
-
-function setAutoscanProgress(p) {
-  autoscanFill.style.width = `${Math.round(Math.max(0, Math.min(1, p)) * 100)}%`;
 }
 
 function showCameraFallback(msg) {
@@ -393,8 +373,8 @@ async function startScanCamera() {
     showCameraFallback("This browser can't open the camera here. Upload a photo instead.");
     return;
   }
-  if (cameraStream) {                 // already running — just (re)start analysis
-    runAnalyzeLoop();
+  if (cameraStream) {                 // already running
+    captureNowBtn.hidden = false;
     return;
   }
   enableCameraBtn.hidden = true;
@@ -409,7 +389,7 @@ async function startScanCamera() {
     if (err && (err.name === "NotAllowedError" || err.name === "SecurityError")) {
       // Permission denied, or the browser wants a user gesture first.
       enableCameraBtn.hidden = false;
-      showCameraFallback("Camera is blocked. Tap “Enable camera,” or upload a photo.");
+      showCameraFallback("Camera is blocked. Tap “Open camera,” or upload a photo.");
     } else {
       showCameraFallback("No camera available. Upload a photo instead.");
     }
@@ -421,90 +401,17 @@ async function startScanCamera() {
   captureNowBtn.hidden = false;
   cameraFallback.hidden = false;      // keep the escape hatch reachable, collapsed
   scanStatus.textContent = "";
-  steadyCount = 0;
-  prevGray = null;
-  setAutoscanProgress(0);
-  setHint(autoCaptureSuspended ? "Tap Capture now to try again" : "Point at a card");
-  runAnalyzeLoop();
+  setHint("Fill the frame with the card, then tap Capture");
 }
 
 function stopScanCamera() {
-  if (analyzeTimer) { clearInterval(analyzeTimer); analyzeTimer = null; }
   if (cameraStream) {
     cameraStream.getTracks().forEach((t) => t.stop());
     cameraStream = null;
   }
   cameraVideo.srcObject = null;
   cameraStage.hidden = true;
-  cameraStage.classList.remove("is-ready");
   captureNowBtn.hidden = true;
-  setAutoscanProgress(0);
-}
-
-function runAnalyzeLoop() {
-  if (analyzeTimer) clearInterval(analyzeTimer);
-  analyzeTimer = setInterval(analyzeFrame, ANALYZE_INTERVAL);
-}
-
-function analyzeFrame() {
-  if (capturing || !cameraStream) return;
-  if (autoCaptureSuspended) {
-    setHint("Tap Capture now to try again");
-    setAutoscanProgress(0);
-    cameraStage.classList.remove("is-ready");
-    return;
-  }
-  const vw = cameraVideo.videoWidth, vh = cameraVideo.videoHeight;
-  if (!vw || !vh) return;
-  const w = ANALYZE_W;
-  const h = Math.max(1, Math.round((vh / vw) * w));
-  analyzeCanvas.width = w;
-  analyzeCanvas.height = h;
-  analyzeCtx.drawImage(cameraVideo, 0, 0, w, h);
-  let data;
-  try { data = analyzeCtx.getImageData(0, 0, w, h).data; } catch (_) { return; }
-
-  // Grayscale
-  const gray = new Float32Array(w * h);
-  for (let i = 0, p = 0; i < data.length; i += 4, p++) {
-    gray[p] = 0.299 * data[i] + 0.587 * data[i + 1] + 0.114 * data[i + 2];
-  }
-
-  // Sharpness — variance of the Laplacian over interior pixels
-  let lapSum = 0, lapSqSum = 0, n = 0;
-  for (let y = 1; y < h - 1; y++) {
-    for (let x = 1; x < w - 1; x++) {
-      const idx = y * w + x;
-      const lap = 4 * gray[idx] - gray[idx - 1] - gray[idx + 1] - gray[idx - w] - gray[idx + w];
-      lapSum += lap;
-      lapSqSum += lap * lap;
-      n++;
-    }
-  }
-  const lapMean = lapSum / n;
-  const sharpness = lapSqSum / n - lapMean * lapMean;
-
-  // Stability — mean absolute gray delta vs the previous frame
-  let diff = Infinity;
-  if (prevGray && prevGray.length === gray.length) {
-    let s = 0;
-    for (let i = 0; i < gray.length; i++) s += Math.abs(gray[i] - prevGray[i]);
-    diff = s / gray.length;
-  }
-  prevGray = gray;
-
-  const sharp = sharpness >= SHARP_MIN;
-  const steady = diff <= STABLE_DIFF;
-
-  if (!sharp && steady) setHint("Focusing… move a little closer or add light");
-  else if (!steady) setHint("Hold steady");
-  else setHint("Hold it…");
-
-  steadyCount = sharp && steady ? steadyCount + 1 : 0;
-  cameraStage.classList.toggle("is-ready", steadyCount >= 2);
-  setAutoscanProgress(steadyCount / READY_FRAMES);
-
-  if (steadyCount >= READY_FRAMES) captureAndIdentify();
 }
 
 async function captureFrameFile() {
@@ -523,10 +430,7 @@ async function captureFrameFile() {
 async function captureAndIdentify() {
   if (capturing || !cameraStream) return;
   capturing = true;
-  autoCaptureSuspended = false;
   setHint("Got it!");
-  cameraStage.classList.add("is-ready");
-  setAutoscanProgress(1);
   let file;
   try {
     file = await captureFrameFile();
@@ -549,7 +453,6 @@ captureNowBtn.addEventListener("click", () => {
 
 enableCameraBtn.addEventListener("click", () => {
   enableCameraBtn.hidden = true;
-  autoCaptureSuspended = false;
   startScanCamera();
 });
 

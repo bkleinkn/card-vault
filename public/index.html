@@ -28,18 +28,17 @@
     <section class="view" data-view="scan">
       <div class="scan-hero">
         <h2>Scan a card</h2>
-        <p class="muted">Tap <strong>Open camera</strong>, then point at a card and hold steady &mdash; it captures on its own once the picture is sharp. Good light helps.</p>
+        <p class="muted">Tap <strong>Open camera</strong>, fill the frame with the card, then tap <strong>Capture</strong>. Good light helps.</p>
       </div>
 
       <div id="camera-stage" class="camera-stage" hidden>
         <video id="camera-video" playsinline muted autoplay></video>
         <div class="camera-guide" aria-hidden="true"></div>
         <div id="camera-hint" class="camera-hint">Starting camera&hellip;</div>
-        <div class="autoscan-track" aria-hidden="true"><div id="autoscan-fill" class="autoscan-fill"></div></div>
       </div>
 
       <button id="enable-camera-btn" class="big-button primary" hidden>Enable camera</button>
-      <button id="capture-now-btn" class="big-button" hidden>Capture now</button>
+      <button id="capture-now-btn" class="big-button primary" hidden>Capture</button>
 
       <details id="camera-fallback" class="camera-fallback" hidden>
         <summary>Camera not working? Upload a photo instead</summary>
