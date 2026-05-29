@@ -227,7 +227,7 @@ function route() {
   if (hash.startsWith("#/scan")) {
     showView("scan");
     autoCaptureSuspended = false;
-    startScanCamera();
+    showCameraStart();
   } else if (hash.startsWith("#/collection")) {
     showView("collection");
     renderCollection();
@@ -244,7 +244,7 @@ function route() {
   } else {
     showView("scan");
     autoCaptureSuspended = false;
-    startScanCamera();
+    showCameraStart();
   }
 }
 window.addEventListener("hashchange", route);
@@ -309,13 +309,12 @@ async function runIdentify() {
     location.hash = "#/result";
   } catch (err) {
     console.error(err);
-    scanStatus.textContent = "Couldn't identify that one. Hold steady to try again, or tap Capture now.";
-    // Resume a live preview so a retry is one steady hold away, but suspend
-    // AUTO-capture so a persistent failure can't loop and hammer the API.
+    // Drop back to the idle state so the user re-opens the camera to retry —
+    // this also prevents a persistent failure from looping and hammering the API.
     if ((location.hash || "#/scan").startsWith("#/scan")) {
-      autoCaptureSuspended = true;
-      startScanCamera();
+      showCameraStart();
     }
+    scanStatus.textContent = "Couldn't identify that one. Tap Open camera to try again, or upload a photo.";
   } finally {
     identifyBtn.disabled = false;
   }
@@ -368,6 +367,23 @@ function showCameraFallback(msg) {
   cameraFallback.open = true;
   captureNowBtn.hidden = true;
   if (msg) scanStatus.textContent = msg;
+}
+
+// Idle state for the scan view: camera OFF, "Open camera" button showing.
+// The camera only starts when the user taps it — never automatically.
+function showCameraStart() {
+  stopScanCamera();
+  if (!camSupported()) {
+    enableCameraBtn.hidden = true;
+    showCameraFallback("This browser can't open the camera here. Upload a photo instead.");
+    return;
+  }
+  cameraStage.hidden = true;
+  captureNowBtn.hidden = true;
+  enableCameraBtn.textContent = "Open camera";
+  enableCameraBtn.hidden = false;
+  cameraFallback.hidden = false;      // keep the upload escape hatch reachable
+  scanStatus.textContent = "";
 }
 
 async function startScanCamera() {
@@ -537,12 +553,13 @@ enableCameraBtn.addEventListener("click", () => {
   startScanCamera();
 });
 
-// Release the camera when the tab is hidden; resume on return if still scanning.
+// Release the camera when the tab is hidden. On return, drop back to the
+// idle "Open camera" state — never silently re-open the camera.
 document.addEventListener("visibilitychange", () => {
   if (document.hidden) {
     stopScanCamera();
   } else if (!capturing && (location.hash || "#/scan").startsWith("#/scan")) {
-    startScanCamera();
+    showCameraStart();
   }
 });
 

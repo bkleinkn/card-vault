@@ -102,7 +102,11 @@ exports.identifyCard = onCall(
       throw new HttpsError("invalid-argument", "frontImageBase64 is required.");
     }
 
-    const client = new Anthropic({ apiKey: ANTHROPIC_API_KEY.value() });
+    // Strip a leading BOM (U+FEFF) and any stray whitespace/newlines that can
+    // sneak into the secret when it's pasted/saved on Windows — otherwise the
+    // SDK rejects the value as "not a legal HTTP header value".
+    const apiKey = ANTHROPIC_API_KEY.value().replace(/^﻿/, "").trim();
+    const client = new Anthropic({ apiKey });
 
     // Build the user turn: instruction text + image(s).
     const userContent = [
