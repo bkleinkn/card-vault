@@ -94,11 +94,17 @@ const detailState = {
 const collectionFilters = {
   sort: "newest",
   sport: "all",
+  location: "all",
   rookieOnly: false,
   hofOnly: false,
   yearFrom: null,
   yearTo: null,
 };
+
+// User-defined storage locations (binder, box, shelf…). Loaded from Firestore
+// at users/{uid}/locations. Cards reference one by `locationId`; the name is
+// resolved from this cache so a rename propagates everywhere automatically.
+let locationsCache = [];
 
 // --- Sample cards (demo mode only) -----------------------------------------
 // Auto-loaded into the collection when Firebase isn't wired so users can
@@ -236,6 +242,9 @@ function route() {
     renderDetail(id);
   } else if (hash.startsWith("#/result")) {
     showView("result");
+  } else if (hash.startsWith("#/locations")) {
+    showView("locations");
+    renderLocations();
   } else if (hash.startsWith("#/about")) {
     showView("about");
   } else if (hash.startsWith("#/guide")) {
@@ -728,9 +737,11 @@ let cardsCache = [];
 async function renderCollection() {
   if (IS_DEMO || !currentUser) {
     cardsCache = SAMPLE_CARDS.slice();
+    locationsCache = [];
     drawCollection();
     return;
   }
+  await loadLocations();
   const snap = await getDocs(
     query(collection(db, "users", currentUser.uid, "cards"), orderBy("createdAt", "desc")),
   );
@@ -757,6 +768,13 @@ function applyFiltersAndSort(cards) {
       if (!haystack.includes(term)) return false;
     }
     if (f.sport !== "all" && c.identified?.sport !== f.sport) return false;
+    if (f.location !== "all") {
+      // A card counts as "assigned" only if its locationId still resolves to an
+      // existing location — a dangling id (location since deleted) is unassigned.
+      const resolved = !!c.locationId && locationsCache.some((l) => l.id === c.locationId);
+      if (f.location === "none" && resolved) return false;
+      if (f.location !== "none" && c.locationId !== f.location) return false;
+    }
     if (f.rookieOnly && !c.identified?.isRookie) return false;
     if (f.hofOnly && !c.identified?.isHOF) return false;
     const y = c.identified?.year;
@@ -769,6 +787,7 @@ function applyFiltersAndSort(cards) {
 }
 
 function drawCollection() {
+  populateLocationFilter();
   const filtered = applyFiltersAndSort(cardsCache);
   ensureDemoBanner();
 
@@ -902,11 +921,13 @@ function ensureDemoBanner() {
 
 function clearAllFilters() {
   collectionFilters.sport = "all";
+  collectionFilters.location = "all";
   collectionFilters.rookieOnly = false;
   collectionFilters.hofOnly = false;
   collectionFilters.yearFrom = null;
   collectionFilters.yearTo = null;
   filterSportEl.value = "all";
+  if (filterLocationEl) filterLocationEl.value = "all";
   filterRookieEl.checked = false;
   filterHofEl.checked = false;
   filterYearFromEl.value = "";
@@ -931,6 +952,12 @@ filterSportEl.addEventListener("change", () => {
   collectionFilters.sport = filterSportEl.value;
   drawCollection();
 });
+if (filterLocationEl) {
+  filterLocationEl.addEventListener("change", () => {
+    collectionFilters.location = filterLocationEl.value;
+    drawCollection();
+  });
+}
 filterRookieEl.addEventListener("change", () => {
   collectionFilters.rookieOnly = filterRookieEl.checked;
   drawCollection();
@@ -962,7 +989,7 @@ exportCsvEl.addEventListener("click", () => {
 
 // --- CSV export ------------------------------------------------------------
 function exportCSV(cards) {
-  const headers = ["Player", "Year", "Set", "Card #", "Sport", "Rookie", "HOF", "Value Low", "Value High", "Notes", "Date Added"];
+  const headers = ["Player", "Year", "Set", "Card #", "Sport", "Rookie", "HOF", "Value Low", "Value High", "Location", "Notes", "Date Added"];
   const rows = cards.map((c) => [
     c.identified?.player || "",
     c.identified?.year || "",
@@ -973,6 +1000,7 @@ function exportCSV(cards) {
     c.identified?.isHOF ? "Yes" : "",
     c.valueEstimate?.low || "",
     c.valueEstimate?.high || "",
+    locationName(c.locationId),
     (c.userNotes || "").replace(/\r?\n/g, " "),
     formatDate(c.createdAt),
   ]);
@@ -1041,6 +1069,8 @@ async function renderDetail(cardId) {
     detailState.editing = false;
   }
 
+  await loadLocations();
+
   if (detailState.editing) {
     renderDetailEditing(el);
   } else {
@@ -1073,6 +1103,7 @@ function renderDetailDisplay(el) {
       ${renderEbayBlock(c.ebayPrices)}
       ${renderPriceLinks(c.identified)}
     </div>
+    ${c.locationId && locationName(c.locationId) ? `<div class="location-display">📍 <strong>Location:</strong> ${esc(locationName(c.locationId))}</div>` : ""}
     ${c.userNotes ? `<div class="notes-display">${esc(c.userNotes)}</div>` : ""}
     ${ebaySectionHTML(c)}
     ${IS_DEMO ? "" : `<div class="row"><button id="detail-edit-btn" class="big-button">Edit details &amp; notes</button></div>`}
@@ -1104,9 +1135,21 @@ function renderDetailDisplay(el) {
 
 function renderDetailEditing(el) {
   const c = detailState.card;
+  const locationOptions = [
+    `<option value="">— No location —</option>`,
+    ...locationsCache.map(
+      (l) => `<option value="${esc(l.id)}" ${c.locationId === l.id ? "selected" : ""}>${esc(l.name)}</option>`,
+    ),
+  ].join("");
+
   el.innerHTML =
     renderEditFormHTML(c.identified || {}) +
     `<div class="notes-section">
+       <label for="detail-location">Location</label>
+       <select id="detail-location" class="control-select">${locationOptions}</select>
+       <a class="link-button" href="#/locations">Manage locations</a>
+     </div>
+     <div class="notes-section">
        <label for="detail-notes">Your notes</label>
        <textarea id="detail-notes" placeholder="e.g. From Grandpa's collection">${esc(c.userNotes || "")}</textarea>
      </div>
@@ -1121,12 +1164,14 @@ function renderDetailEditing(el) {
     applyBtn.textContent = "Saving...";
     const updatedIdentified = { ...c.identified, ...readEditFormValues(), userEdited: true };
     const updatedNotes = document.getElementById("detail-notes").value;
+    const updatedLocationId = document.getElementById("detail-location").value || null;
     try {
       await updateDoc(doc(db, "users", currentUser.uid, "cards", detailState.cardId), {
         identified: updatedIdentified,
         userNotes: updatedNotes || null,
+        locationId: updatedLocationId,
       });
-      detailState.card = { ...c, identified: updatedIdentified, userNotes: updatedNotes || null };
+      detailState.card = { ...c, identified: updatedIdentified, userNotes: updatedNotes || null, locationId: updatedLocationId };
       detailState.editing = false;
       renderDetail(detailState.cardId);
     } catch (err) {
@@ -1145,6 +1190,157 @@ function renderDetailEditing(el) {
 document.getElementById("back-btn").addEventListener("click", () => {
   history.back();
 });
+
+// --- Locations -------------------------------------------------------------
+const locationsListEl = document.getElementById("locations-list");
+const locationsEmptyEl = document.getElementById("locations-empty");
+const locationAddForm = document.getElementById("location-add-form");
+const locationAddInput = document.getElementById("location-add-input");
+const filterLocationEl = document.getElementById("filter-location");
+
+async function loadLocations() {
+  if (IS_DEMO || !currentUser) {
+    locationsCache = [];
+    return;
+  }
+  const snap = await getDocs(
+    query(collection(db, "users", currentUser.uid, "locations"), orderBy("name")),
+  );
+  locationsCache = snap.docs.map((d) => ({ id: d.id, ...d.data() }));
+}
+
+function locationName(id) {
+  if (!id) return "";
+  const loc = locationsCache.find((l) => l.id === id);
+  return loc ? loc.name : "";
+}
+
+async function renderLocations() {
+  if (IS_DEMO || !currentUser) {
+    locationsListEl.innerHTML = "";
+    locationsEmptyEl.innerHTML = `<p>Sign in to create and manage locations.</p>`;
+    locationsEmptyEl.hidden = false;
+    return;
+  }
+
+  locationsListEl.innerHTML = `<p class="muted">Loading…</p>`;
+  await loadLocations();
+
+  // Count how many cards sit in each location so the list doubles as a map.
+  const counts = {};
+  try {
+    const snap = await getDocs(collection(db, "users", currentUser.uid, "cards"));
+    snap.docs.forEach((d) => {
+      const lid = d.data().locationId;
+      if (lid) counts[lid] = (counts[lid] || 0) + 1;
+    });
+  } catch (err) {
+    console.warn("Couldn't count cards per location", err);
+  }
+
+  if (locationsCache.length === 0) {
+    locationsListEl.innerHTML = "";
+    locationsEmptyEl.innerHTML = `<p>No locations yet. Add one above &mdash; like &ldquo;Binder A&rdquo; or &ldquo;Shoebox in the closet.&rdquo;</p>`;
+    locationsEmptyEl.hidden = false;
+    return;
+  }
+
+  locationsEmptyEl.hidden = true;
+  locationsListEl.innerHTML = locationsCache
+    .map((l) => {
+      const n = counts[l.id] || 0;
+      return `
+        <div class="location-row" data-id="${esc(l.id)}">
+          <div class="location-main">
+            <span class="location-name">${esc(l.name)}</span>
+            <span class="location-count">${n} card${n === 1 ? "" : "s"}</span>
+          </div>
+          <div class="location-actions">
+            <button type="button" class="link-button" data-act="rename">Rename</button>
+            <button type="button" class="link-button danger" data-act="delete">Delete</button>
+          </div>
+        </div>`;
+    })
+    .join("");
+}
+
+if (locationAddForm) {
+  locationAddForm.addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const name = locationAddInput.value.trim();
+    if (!name) return;
+    if (IS_DEMO || !currentUser) {
+      alert("Sign in to add locations.");
+      return;
+    }
+    try {
+      const id = crypto.randomUUID();
+      await setDoc(doc(db, "users", currentUser.uid, "locations", id), {
+        name,
+        createdAt: serverTimestamp(),
+      });
+      locationAddInput.value = "";
+      await renderLocations();
+    } catch (err) {
+      console.error(err);
+      alert("Couldn't add that location. Try again.");
+    }
+  });
+}
+
+if (locationsListEl) {
+  locationsListEl.addEventListener("click", async (e) => {
+    const btn = e.target.closest("button[data-act]");
+    if (!btn) return;
+    const row = btn.closest(".location-row");
+    const id = row && row.dataset.id;
+    if (!id) return;
+    const loc = locationsCache.find((l) => l.id === id);
+
+    if (btn.dataset.act === "rename") {
+      const next = prompt("Rename location", loc ? loc.name : "");
+      if (next == null) return;
+      const name = next.trim();
+      if (!name) return;
+      try {
+        await updateDoc(doc(db, "users", currentUser.uid, "locations", id), { name });
+        await renderLocations();
+      } catch (err) {
+        console.error(err);
+        alert("Couldn't rename. Try again.");
+      }
+    } else if (btn.dataset.act === "delete") {
+      const label = loc ? loc.name : "this location";
+      if (!confirm(`Delete “${label}”? Cards assigned to it will become unassigned.`)) return;
+      try {
+        await deleteDoc(doc(db, "users", currentUser.uid, "locations", id));
+        await renderLocations();
+      } catch (err) {
+        console.error(err);
+        alert("Couldn't delete. Try again.");
+      }
+    }
+  });
+}
+
+// Keep the collection's Location filter <select> in sync with the cache.
+function populateLocationFilter() {
+  if (!filterLocationEl) return;
+  const current = collectionFilters.location;
+  const opts = [
+    `<option value="all">All locations</option>`,
+    `<option value="none">Unassigned</option>`,
+    ...locationsCache.map((l) => `<option value="${esc(l.id)}">${esc(l.name)}</option>`),
+  ];
+  filterLocationEl.innerHTML = opts.join("");
+  // Preserve the active selection if it still exists; otherwise fall back.
+  const stillValid =
+    current === "all" ||
+    current === "none" ||
+    locationsCache.some((l) => l.id === current);
+  collectionFilters.location = stillValid ? current : "all";
+  filterLocationEl.value = collectionFilters.location;
+}
 
 // --- Helpers ---------------------------------------------------------------
 function esc(s) {

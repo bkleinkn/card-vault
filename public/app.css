@@ -320,6 +320,75 @@ p { color: var(--ink-soft); margin: 8px 0; }
   letter-spacing: 0.02em;
 }
 
+/* ---------- Locations ---------- */
+.location-add {
+  display: flex;
+  gap: 8px;
+  align-items: flex-start;
+  margin: 4px 0 16px;
+}
+.location-add .search-input { margin: 0; }
+.location-add .control-btn { margin: 0; }
+
+.locations-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.location-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 12px 14px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+}
+
+.location-main {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+.location-name {
+  font-weight: 600;
+  color: var(--ink);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.location-count {
+  font-size: 12px;
+  color: var(--ink-faint);
+}
+
+.location-actions {
+  display: flex;
+  gap: 14px;
+  flex-shrink: 0;
+}
+.link-button.danger { color: var(--danger); }
+.link-button.danger:hover { color: var(--rose-soft); }
+
+/* Assigned-location chip on the card detail page */
+.location-display {
+  background: var(--info-bg);
+  border: 1px solid var(--info-border);
+  border-left: 3px solid var(--accent);
+  border-radius: var(--radius-sm);
+  padding: 10px 14px;
+  margin: 14px 0;
+  font-size: 14px;
+  color: var(--ink-2);
+}
+
+/* Location <select> inside the detail edit form should fill the row */
+.notes-section select { width: 100%; }
+.notes-section .link-button { padding: 8px 0 0; }
+
 /* ---------- Live camera ---------- */
 .camera-stage {
   position: relative;

@@ -111,6 +111,11 @@
               <option value="other">Other</option>
             </select>
           </label>
+          <label class="filter-field">Location
+            <select id="filter-location">
+              <option value="all">All locations</option>
+            </select>
+          </label>
         </div>
         <div class="filter-chips">
           <label class="chip-toggle">
@@ -140,6 +145,20 @@
     <section class="view" data-view="detail" hidden>
       <button id="back-btn" class="link-button">&larr; Back</button>
       <div id="detail-content"></div>
+    </section>
+
+    <!-- Locations view -->
+    <section class="view" data-view="locations" hidden>
+      <div class="collection-header">
+        <h2>Locations</h2>
+        <p class="muted">Where your cards physically live &mdash; a binder, a box, a shelf. Create locations here, then assign one to a card from its detail page.</p>
+      </div>
+      <form id="location-add-form" class="location-add">
+        <input id="location-add-input" type="text" class="search-input" placeholder="e.g. Binder A &mdash; Page 3" autocomplete="off" maxlength="80" />
+        <button type="submit" class="control-btn">Add</button>
+      </form>
+      <div id="locations-list" class="locations-list"></div>
+      <div id="locations-empty" class="empty-state" hidden></div>
     </section>
 
     <!-- About view -->
@@ -294,6 +313,7 @@
   <nav class="bottomnav" role="navigation" aria-label="Main">
     <a href="#/scan" class="navlink" data-nav="scan">Scan</a>
     <a href="#/collection" class="navlink" data-nav="collection">Collection</a>
+    <a href="#/locations" class="navlink" data-nav="locations">Locations</a>
     <a href="#/guide" class="navlink" data-nav="guide">Guide</a>
   </nav>
 
