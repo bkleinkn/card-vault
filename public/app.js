@@ -80,9 +80,11 @@ const IS_DEMO = !FIREBASE_READY;
 const state = {
   frontFile: null,
   backFile: null,
-  lastIdentified: null, // { identified, valueEstimate }
+  lastIdentified: null, // { identified, valueEstimate, itemType }
   notes: "",
   editingResult: false,
+  reviewJobId: null,    // when set, the result view is reviewing a queued scan
+  itemType: "card",     // what the scanner is currently set to: card | pack | box
 };
 
 const detailState = {
@@ -94,6 +96,7 @@ const detailState = {
 const collectionFilters = {
   sort: "newest",
   sport: "all",
+  itemType: "all",
   location: "all",
   rookieOnly: false,
   hofOnly: false,
@@ -215,6 +218,45 @@ const SAMPLE_CARDS = SAMPLE_RAW.map((r, i) => {
   return card;
 });
 
+// A couple of sealed-product samples so the demo collection shows packs/boxes
+// (and the item-type filter has something to filter).
+SAMPLE_CARDS.push(
+  {
+    id: "sample-pack-1",
+    createdAt: { seconds: Math.floor(Date.now() / 1000) - 86400 * 3 },
+    itemType: "pack",
+    imageFrontUrl: makeSampleImg("PACK"),
+    identified: {
+      sport: "baseball",
+      year: 1987,
+      set: "Topps",
+      itemLabel: "Wax Pack",
+      configuration: "17 cards + 1 stick of gum",
+      sealed: true,
+      notable: "Set includes Barry Bonds and Bo Jackson rookie cards.",
+      confidence: 0.8,
+    },
+    valueEstimate: { low: 8, high: 30, note: "Rough sample value." },
+  },
+  {
+    id: "sample-box-1",
+    createdAt: { seconds: Math.floor(Date.now() / 1000) - 86400 * 6 },
+    itemType: "box",
+    imageFrontUrl: makeSampleImg("BOX"),
+    identified: {
+      sport: "basketball",
+      year: 1986,
+      set: "Fleer",
+      itemLabel: "Wax Box",
+      configuration: "36 wax packs, 12 cards each",
+      sealed: true,
+      notable: "The set famous for the Michael Jordan rookie card.",
+      confidence: 0.6,
+    },
+    valueEstimate: { low: 50000, high: 250000, note: "Rough sample value." },
+  },
+);
+
 // --- Routing ---------------------------------------------------------------
 function showView(name) {
   document.querySelectorAll(".view").forEach((v) => {
@@ -268,9 +310,17 @@ const captureBackInput = document.getElementById("capture-back");
 // (and optional back), then taps Identify — no auto-run, so the back isn't
 // skipped.
 captureFrontInput.addEventListener("change", (e) => {
-  const f = e.target.files?.[0];
-  if (!f) return;
-  state.frontFile = f;
+  const files = Array.from(e.target.files || []);
+  if (!files.length) return;
+  // Multiple files selected, or bulk mode on → drop them all into the queue
+  // instead of the single-card preview/Identify path.
+  if (files.length > 1 || QUEUE.bulk) {
+    files.forEach((f) => enqueueScan(f));
+    captureFrontInput.value = "";
+    scanStatus.textContent = `Added ${files.length} card${files.length > 1 ? "s" : ""} to the queue below.`;
+    return;
+  }
+  state.frontFile = files[0];
   renderPreviews();
 });
 
@@ -280,6 +330,27 @@ captureBackInput.addEventListener("change", (e) => {
   state.backFile = f;
   renderPreviews();
 });
+
+// Item-type selector: card / pack / box. Sets state.itemType, which every new
+// capture (live or upload) is tagged with so the Cloud Function uses the right
+// identify prompt.
+document.querySelectorAll(".itemtype-btn").forEach((btn) => {
+  btn.addEventListener("click", () => {
+    state.itemType = btn.dataset.itemtype;
+    document.querySelectorAll(".itemtype-btn").forEach((b) => {
+      b.classList.toggle("active", b === btn);
+    });
+    // Update the live-camera hint if the camera is already open.
+    if (cameraStream) {
+      setHint(`Scanning a ${itemNoun(state.itemType)} — fill the frame, then tap Capture.`);
+    }
+  });
+});
+
+// Human-readable nouns for the three item types.
+function itemNoun(t) {
+  return t === "pack" ? "sealed pack" : t === "box" ? "sealed box" : "card";
+}
 
 function renderPreviews() {
   previewsEl.innerHTML = "";
@@ -308,9 +379,10 @@ async function runIdentify() {
   identifyBtn.disabled = true;
   scanStatus.textContent = "Looking at your card…";
   try {
-    const result = await identifyCard(state.frontFile, state.backFile);
+    const result = await identifyCard(state.frontFile, state.backFile, state.itemType);
     state.lastIdentified = result;
     state.editingResult = false;
+    state.reviewJobId = null;
     renderResult(result);
     scanStatus.textContent = "";
     location.hash = "#/result";
@@ -362,6 +434,9 @@ function showCameraFallback(msg) {
 // The camera only starts when the user taps it — never automatically.
 function showCameraStart() {
   stopScanCamera();
+  hideSingleProcessing();
+  renderTray();
+  updateNavBadge();
   if (!camSupported()) {
     enableCameraBtn.hidden = true;
     showCameraFallback("This browser can't open the camera here. Upload a photo instead.");
@@ -410,7 +485,11 @@ async function startScanCamera() {
   captureNowBtn.hidden = false;
   cameraFallback.hidden = false;      // keep the escape hatch reachable, collapsed
   scanStatus.textContent = "";
-  setHint("Fill the frame with the card, then tap Capture");
+  setHint(
+    QUEUE.bulk
+      ? "Bulk mode — tap Capture for each card, one after another."
+      : "Fill the frame with the card, then tap Capture",
+  );
 }
 
 function stopScanCamera() {
@@ -448,12 +527,17 @@ async function captureAndIdentify() {
     capturing = false;
     return;
   }
-  stopScanCamera();
-  state.frontFile = file;
-  state.backFile = null;
-  renderPreviews();
-  capturing = false;
-  await runIdentify();
+  const job = enqueueScan(file);
+  if (QUEUE.bulk) {
+    // Bulk mode: keep streaming, just confirm the grab and let it process.
+    setHint(`Added ✓ — ${QUEUE.jobs.length} in queue. Snap the next card.`);
+    capturing = false;
+  } else {
+    // Single mode: stop the camera and offer "wait here" vs "scan next."
+    stopScanCamera();
+    capturing = false;
+    showSingleProcessing(job);
+  }
 }
 
 captureNowBtn.addEventListener("click", () => {
@@ -475,26 +559,370 @@ document.addEventListener("visibilitychange", () => {
   }
 });
 
+// --- Background scan queue --------------------------------------------------
+// Each capture becomes a job that identifies in the background (no upload yet —
+// the File is held in memory). A finished job waits as "ready" in the review
+// tray; the image is only written to Storage/Firestore when the user confirms
+// the card from the result view (so abandoned scans never leave orphans).
+const scanProcessingEl = document.getElementById("scan-processing");
+const scanQueueEl = document.getElementById("scan-queue");
+const bulkToggleEl = document.getElementById("bulk-toggle");
+
+const QUEUE = {
+  jobs: [],            // { id, frontFile, backFile, thumbUrl, status, result, notes, error }
+  bulk: false,
+  active: 0,
+  waitingJobId: null,  // single-mode: auto-open this job's result when it lands
+  MAX: 3,              // cap concurrent identify calls (cost + load)
+};
+
+function enqueueScan(frontFile, backFile = null) {
+  const job = {
+    id: crypto.randomUUID(),
+    frontFile,
+    backFile,
+    itemType: state.itemType,   // tag the scan with whatever the selector was on
+    thumbUrl: URL.createObjectURL(frontFile),
+    status: "queued",      // queued → identifying → ready | error
+    result: null,
+    notes: "",
+    error: null,
+  };
+  QUEUE.jobs.push(job);
+  renderTray();
+  updateNavBadge();
+  pumpQueue();
+  return job;
+}
+
+function pumpQueue() {
+  while (QUEUE.active < QUEUE.MAX) {
+    const next = QUEUE.jobs.find((j) => j.status === "queued");
+    if (!next) break;
+    runJob(next);
+  }
+}
+
+async function runJob(job) {
+  job.status = "identifying";
+  QUEUE.active++;
+  renderTray();
+  try {
+    const result = await identifyCard(job.frontFile, job.backFile, job.itemType);
+    if (!QUEUE.jobs.includes(job)) return; // discarded mid-flight
+    job.result = result;
+    job.status = "ready";
+  } catch (err) {
+    console.error("Background identify failed", err);
+    if (!QUEUE.jobs.includes(job)) return;
+    job.status = "error";
+    job.error = err;
+  } finally {
+    QUEUE.active = Math.max(0, QUEUE.active - 1);
+    renderTray();
+    updateNavBadge();
+    // Single-mode "wait here": auto-open the result the moment it's ready.
+    if (QUEUE.waitingJobId === job.id && QUEUE.jobs.includes(job)) {
+      QUEUE.waitingJobId = null;
+      if (job.status === "ready") reviewJob(job.id);
+      else if (job.status === "error") showSingleError(job);
+    }
+    pumpQueue();
+  }
+}
+
+function retryJob(id) {
+  const job = QUEUE.jobs.find((j) => j.id === id);
+  if (!job) return;
+  job.status = "queued";
+  job.error = null;
+  renderTray();
+  pumpQueue();
+}
+
+function discardJob(id) {
+  const job = QUEUE.jobs.find((j) => j.id === id);
+  if (!job) return;
+  if (job.thumbUrl) URL.revokeObjectURL(job.thumbUrl);
+  QUEUE.jobs = QUEUE.jobs.filter((j) => j.id !== id);
+  if (QUEUE.waitingJobId === id) QUEUE.waitingJobId = null;
+  renderTray();
+  updateNavBadge();
+}
+
+// Load a "ready" job into the result view for confirm / edit / save.
+function reviewJob(id) {
+  const job = QUEUE.jobs.find((j) => j.id === id);
+  if (!job || job.status !== "ready") return;
+  hideSingleProcessing();
+  state.frontFile = job.frontFile;
+  state.backFile = job.backFile || null;
+  state.lastIdentified = job.result;
+  state.notes = job.notes || "";
+  state.editingResult = false;
+  state.reviewJobId = id;
+  resultNotesEl.value = state.notes;
+  renderResult(job.result);
+  location.hash = "#/result";
+}
+
+// After saving a reviewed card, step to the next ready one (or leave the
+// review flow). Used by the result-view Save button and "Review" tray button.
+function reviewNext() {
+  const next = QUEUE.jobs.find((j) => j.status === "ready");
+  if (next) {
+    reviewJob(next.id);
+    return;
+  }
+  state.reviewJobId = null;
+  resetScanInputs();
+  // Still processing some? Send them back to the queue. Otherwise the collection.
+  location.hash = QUEUE.jobs.length ? "#/scan" : "#/collection";
+}
+
+function renderTray() {
+  if (!scanQueueEl) return;
+  const jobs = QUEUE.jobs;
+  if (!jobs.length) {
+    scanQueueEl.hidden = true;
+    scanQueueEl.innerHTML = "";
+    return;
+  }
+  scanQueueEl.hidden = false;
+
+  const working = jobs.filter((j) => j.status === "queued" || j.status === "identifying").length;
+  const ready = jobs.filter((j) => j.status === "ready").length;
+  const errored = jobs.filter((j) => j.status === "error").length;
+  const parts = [];
+  if (working) parts.push(`${working} identifying`);
+  if (ready) parts.push(`${ready} ready to review`);
+  if (errored) parts.push(`${errored} need a retry`);
+  const summary = parts.join(" · ") || `${jobs.length} in queue`;
+
+  scanQueueEl.innerHTML = `
+    <div class="queue-head">
+      <span class="queue-title">Scan queue</span>
+      <span class="queue-summary">${esc(summary)}</span>
+    </div>
+    <div class="queue-items">
+      ${jobs.map(renderJobChip).join("")}
+    </div>
+    ${ready ? `<button id="review-all-btn" class="big-button primary">Review ${ready} card${ready === 1 ? "" : "s"} &rarr;</button>` : ""}
+  `;
+  const reviewAll = document.getElementById("review-all-btn");
+  if (reviewAll) reviewAll.addEventListener("click", reviewNext);
+}
+
+function renderJobChip(job) {
+  let label;
+  if (job.status === "ready") label = displayName(job.result) || "Tap to review";
+  else if (job.status === "error") label = "Tap to retry";
+  else label = "Identifying…";
+  return `
+    <div class="queue-chip qchip-${job.status}" data-job="${esc(job.id)}" role="button" tabindex="0" title="${esc(label)}">
+      <img src="${esc(job.thumbUrl)}" alt="" />
+      <span class="queue-chip-status" aria-hidden="true"></span>
+      <button class="queue-chip-x" data-discard="${esc(job.id)}" aria-label="Remove from queue">×</button>
+      <span class="queue-chip-label">${esc(label)}</span>
+    </div>
+  `;
+}
+
+// Delegated tray interactions (the container persists across re-renders).
+if (scanQueueEl) {
+  scanQueueEl.addEventListener("click", (e) => {
+    const x = e.target.closest("[data-discard]");
+    if (x) {
+      e.stopPropagation();
+      discardJob(x.dataset.discard);
+      return;
+    }
+    const chip = e.target.closest("[data-job]");
+    if (!chip) return;
+    const job = QUEUE.jobs.find((j) => j.id === chip.dataset.job);
+    if (!job) return;
+    if (job.status === "ready") reviewJob(job.id);
+    else if (job.status === "error") retryJob(job.id);
+  });
+}
+
+// Single-mode panel shown right after a capture: wait, or move on.
+function showSingleProcessing(job) {
+  if (!scanProcessingEl) return;
+  QUEUE.waitingJobId = job.id; // auto-open when this one is ready
+  scanProcessingEl.hidden = false;
+  scanProcessingEl.innerHTML = `
+    <div class="processing-card">
+      <img src="${esc(job.thumbUrl)}" alt="" class="processing-thumb" />
+      <div class="processing-body">
+        <div class="processing-spinner" aria-hidden="true"></div>
+        <p class="processing-title">Identifying your card…</p>
+        <p class="processing-sub">Wait here and it opens when ready, or scan the next card while this finishes.</p>
+        <button id="scan-next-btn" class="big-button">Scan next card &rarr;</button>
+      </div>
+    </div>
+  `;
+  document.getElementById("scan-next-btn").addEventListener("click", () => {
+    QUEUE.waitingJobId = null; // it stays in the tray as "ready" for later
+    hideSingleProcessing();
+    startScanCamera();
+  });
+}
+
+function showSingleError(job) {
+  if (!scanProcessingEl) return;
+  scanProcessingEl.hidden = false;
+  scanProcessingEl.innerHTML = `
+    <div class="processing-card error">
+      <img src="${esc(job.thumbUrl)}" alt="" class="processing-thumb" />
+      <div class="processing-body">
+        <p class="processing-title">Couldn't identify that one.</p>
+        <p class="processing-sub">The photo may be blurry, or the network dropped.</p>
+        <div class="row">
+          <button id="proc-retry" class="big-button primary">Try again</button>
+          <button id="proc-discard" class="big-button">Discard</button>
+        </div>
+      </div>
+    </div>
+  `;
+  document.getElementById("proc-retry").addEventListener("click", () => {
+    retryJob(job.id);
+    showSingleProcessing(job);
+  });
+  document.getElementById("proc-discard").addEventListener("click", () => {
+    hideSingleProcessing();
+    discardJob(job.id);
+    showCameraStart();
+  });
+}
+
+function hideSingleProcessing() {
+  if (!scanProcessingEl) return;
+  scanProcessingEl.hidden = true;
+  scanProcessingEl.innerHTML = "";
+}
+
+// Reset the single-card scan inputs (shared by Re-scan and post-save cleanup).
+function resetScanInputs() {
+  state.frontFile = null;
+  state.backFile = null;
+  state.lastIdentified = null;
+  state.notes = "";
+  state.editingResult = false;
+  resultNotesEl.value = "";
+  renderPreviews();
+  captureFrontInput.value = "";
+  captureBackInput.value = "";
+  scanStatus.textContent = "";
+}
+
+// Keep the result view's Save / Re-scan buttons labelled for the active context.
+function syncResultButtons() {
+  const save = document.getElementById("save-btn");
+  const rescan = document.getElementById("rescan-btn");
+  if (!save || !rescan) return;
+  if (state.reviewJobId) {
+    const moreReady = QUEUE.jobs.some((j) => j.status === "ready" && j.id !== state.reviewJobId);
+    save.textContent = moreReady ? "Save & next" : "Save to collection";
+    rescan.textContent = "Discard";
+  } else {
+    save.textContent = "Save to collection";
+    rescan.textContent = "Re-scan";
+  }
+}
+
+// Badge on the Scan nav tab showing how many cards are waiting in the queue.
+function updateNavBadge() {
+  const link = document.querySelector('.navlink[data-nav="scan"]');
+  if (!link) return;
+  let badge = link.querySelector(".nav-badge");
+  const n = QUEUE.jobs.length;
+  if (!n) {
+    if (badge) badge.remove();
+    return;
+  }
+  if (!badge) {
+    badge = document.createElement("span");
+    badge.className = "nav-badge";
+    link.appendChild(badge);
+  }
+  badge.textContent = String(n);
+}
+
+if (bulkToggleEl) {
+  bulkToggleEl.addEventListener("change", () => {
+    QUEUE.bulk = bulkToggleEl.checked;
+    if (QUEUE.bulk) {
+      hideSingleProcessing();
+      if (camSupported() && !cameraStream) startScanCamera();
+      else if (cameraStream) setHint("Bulk mode on — tap Capture for each card.");
+    }
+  });
+}
+
 resultNotesEl.addEventListener("input", (e) => {
   state.notes = e.target.value;
   refreshResultEbayContent();
 });
 
 // --- Identify --------------------------------------------------------------
-async function identifyCard(frontFile, backFile) {
+async function identifyCard(frontFile, backFile, itemType = "card") {
   if (USE_MOCK_AI || !FIREBASE_READY || !currentUser) {
-    return mockIdentify();
+    return mockIdentify(itemType);
   }
   const frontImageBase64 = await fileToShrunkBase64(frontFile);
   const backImageBase64 = backFile ? await fileToShrunkBase64(backFile) : null;
   const callable = httpsCallable(functions, "identifyCard");
-  const res = await callable({ frontImageBase64, backImageBase64 });
+  const res = await callable({ frontImageBase64, backImageBase64, itemType });
   return res.data;
 }
 
-async function mockIdentify() {
+async function mockIdentify(itemType = "card") {
   await new Promise((r) => setTimeout(r, 800));
+  if (itemType === "pack") {
+    return {
+      itemType: "pack",
+      identified: {
+        sport: "baseball",
+        year: 1987,
+        set: "Topps",
+        itemLabel: "Wax Pack",
+        configuration: "17 cards + 1 stick of gum",
+        sealed: true,
+        notable: "Set includes Barry Bonds and Bo Jackson rookie cards.",
+        confidence: 0.78,
+      },
+      valueEstimate: {
+        low: 8,
+        high: 30,
+        note: "Rough estimate for a sealed pack. Authenticity and seal matter a lot — verify with recent eBay sold listings.",
+        estimatedAt: new Date().toISOString(),
+      },
+    };
+  }
+  if (itemType === "box") {
+    return {
+      itemType: "box",
+      identified: {
+        sport: "basketball",
+        year: 1986,
+        set: "Fleer",
+        itemLabel: "Wax Box",
+        configuration: "36 wax packs, 12 cards + 1 sticker each",
+        sealed: true,
+        notable: "The set famous for the Michael Jordan rookie card.",
+        confidence: 0.7,
+      },
+      valueEstimate: {
+        low: 50000,
+        high: 250000,
+        note: "Rough estimate for a sealed box. Authenticity and seal matter a lot — verify with recent eBay sold listings.",
+        estimatedAt: new Date().toISOString(),
+      },
+    };
+  }
   return {
+    itemType: "card",
     identified: {
       sport: "baseball",
       year: 1956,
@@ -538,6 +966,57 @@ async function fileToShrunkBase64(file, maxDim = 1280) {
   return canvas.toDataURL("image/jpeg", 0.85).split(",")[1];
 }
 
+// --- Item-type-aware rendering helpers -------------------------------------
+function itemTypeOf(data) {
+  return data?.itemType === "pack" || data?.itemType === "box" ? data.itemType : "card";
+}
+
+// The headline name shown in chips, the collection, and result/detail views.
+function displayName(data) {
+  const id = data?.identified || {};
+  const t = itemTypeOf(data);
+  if (t === "pack") return id.itemLabel || "Card pack";
+  if (t === "box") return id.itemLabel || "Card box";
+  return id.player || "Unknown";
+}
+
+// Small secondary line under each collection tile.
+function collectionCardSub(c) {
+  const id = c?.identified || {};
+  if (itemTypeOf(c) === "card") return id.cardNumber ? `#${esc(id.cardNumber)}` : "";
+  return id.sealed ? "Sealed" : "";
+}
+
+// Headline + meta + badges (+ configuration/notable for sealed product),
+// shared by the result and detail views so both render every type the same way.
+function identifiedSummaryHTML(data) {
+  const id = data.identified || {};
+  const t = itemTypeOf(data);
+  if (t === "pack" || t === "box") {
+    const typeWord = t === "pack" ? "Sealed pack" : "Sealed box";
+    return `
+      <p class="player">${esc(displayName(data))}</p>
+      <p class="meta">${id.year ?? ""} ${esc(id.set || "")} &mdash; ${esc(capSport(id.sport) || "")}</p>
+      <div class="badges">
+        <span class="badge type">${typeWord}</span>
+        ${id.sealed ? `<span class="badge sealed">Looks sealed</span>` : ""}
+        ${typeof id.confidence === "number" ? `<span class="badge">Confidence ${Math.round(id.confidence * 100)}%</span>` : ""}
+      </div>
+      ${id.configuration ? `<p class="item-extra"><strong>What's inside:</strong> ${esc(id.configuration)}</p>` : ""}
+      ${id.notable ? `<p class="item-extra">${esc(id.notable)}</p>` : ""}
+    `;
+  }
+  return `
+    <p class="player">${esc(displayName(data))}</p>
+    <p class="meta">${id.year ?? ""} ${esc(id.set || "")} ${id.cardNumber ? `#${esc(id.cardNumber)}` : ""} &mdash; ${esc(capSport(id.sport) || "")}</p>
+    <div class="badges">
+      ${id.isRookie ? `<span class="badge rookie">Rookie</span>` : ""}
+      ${id.isHOF ? `<span class="badge hof">Hall of Fame</span>` : ""}
+      ${typeof id.confidence === "number" ? `<span class="badge">Confidence ${Math.round(id.confidence * 100)}%</span>` : ""}
+    </div>
+  `;
+}
+
 // --- Result view -----------------------------------------------------------
 function renderResult(data) {
   if (state.editingResult) {
@@ -548,24 +1027,23 @@ function renderResult(data) {
   const el = document.getElementById("result-card");
   const highValue = (valueEstimate?.high || 0) >= 250;
   const uncertain = (identified.confidence || 0) < 0.5;
+  const inReview = !!state.reviewJobId;
+  const moreReady = inReview
+    ? QUEUE.jobs.filter((j) => j.status === "ready" && j.id !== state.reviewJobId).length
+    : 0;
 
   el.innerHTML = `
-    ${highValue ? `<div class="high-value-banner">This may be a valuable card. Get a professional appraisal before selling.</div>` : ""}
+    ${inReview ? `<div class="review-banner">Reviewing an item from your scan queue.${moreReady ? ` ${moreReady} more ready after this.` : ""} Save it to your collection or discard it.</div>` : ""}
+    ${highValue ? `<div class="high-value-banner">This may be valuable. Get a professional appraisal before selling.</div>` : ""}
     ${uncertain ? `<div class="uncertain-banner">I'm not very sure about this one. Does it look right? Tap <strong>Edit details</strong> below to fix anything.</div>` : ""}
-    <p class="player">${esc(identified.player)}</p>
-    <p class="meta">${identified.year ?? ""} ${esc(identified.set || "")} ${identified.cardNumber ? `#${esc(identified.cardNumber)}` : ""} &mdash; ${esc(identified.sport || "")}</p>
-    <div class="badges">
-      ${identified.isRookie ? `<span class="badge rookie">Rookie</span>` : ""}
-      ${identified.isHOF ? `<span class="badge hof">Hall of Fame</span>` : ""}
-      <span class="badge">Confidence ${Math.round((identified.confidence || 0) * 100)}%</span>
-    </div>
+    ${identifiedSummaryHTML(data)}
     <div class="value-block">
       <div class="label muted">Claude AI ballpark</div>
       <div class="range">$${fmt(valueEstimate?.low || 0)} &ndash; $${fmt(valueEstimate?.high || 0)}</div>
       <div class="note">${esc(valueEstimate?.note || "")}</div>
     </div>
     ${renderEbayBlock(data.ebayPrices)}
-    ${renderPriceLinks(identified)}
+    ${renderPriceLinks(data)}
     <button id="edit-details-btn" class="link-button" style="margin-top: 10px;">Edit details</button>
     ${ebaySectionHTML({ ...data, userNotes: state.notes })}
   `;
@@ -574,13 +1052,16 @@ function renderResult(data) {
     state.editingResult = true;
     renderResult(state.lastIdentified);
   });
+
+  syncResultButtons();
 }
 
 function renderResultEditForm() {
   const id = state.lastIdentified.identified || {};
   const el = document.getElementById("result-card");
+  const type = itemTypeOf(state.lastIdentified);
   el.innerHTML =
-    renderEditFormHTML(id) +
+    renderEditFormHTML(id, type) +
     `<div class="row">
        <button id="apply-edits-btn" class="big-button primary">Save changes</button>
        <button id="cancel-edits-btn" class="big-button">Cancel</button>
@@ -589,7 +1070,7 @@ function renderResultEditForm() {
   document.getElementById("apply-edits-btn").addEventListener("click", () => {
     state.lastIdentified.identified = {
       ...state.lastIdentified.identified,
-      ...readEditFormValues(),
+      ...readEditFormValues(type),
       userEdited: true,
     };
     state.editingResult = false;
@@ -601,8 +1082,50 @@ function renderResultEditForm() {
   });
 }
 
-function renderEditFormHTML(identified) {
+function sportSelectHTML(identified) {
   const sports = ["baseball", "football", "basketball", "hockey", "other"];
+  return `
+    <label>Sport
+      <select id="ed-sport">
+        ${sports
+          .map(
+            (s) =>
+              `<option value="${s}" ${identified.sport === s ? "selected" : ""}>${s[0].toUpperCase()}${s.slice(1)}</option>`,
+          )
+          .join("")}
+      </select>
+    </label>`;
+}
+
+function renderEditFormHTML(identified, itemType = "card") {
+  if (itemType === "pack" || itemType === "box") {
+    const word = itemType === "pack" ? "pack" : "box";
+    return `
+      <p class="edit-title">Edit ${word} details</p>
+      <div class="edit-form">
+        <label>Product label
+          <input id="ed-itemLabel" type="text" value="${esc(identified.itemLabel || "")}" placeholder="e.g. Wax ${word === "pack" ? "Pack" : "Box"}, Hobby Box" autocomplete="off" />
+        </label>
+        <label>Year
+          <input id="ed-year" type="number" value="${identified.year || ""}" min="1880" max="2030" inputmode="numeric" />
+        </label>
+        <label>Set / Manufacturer
+          <input id="ed-set" type="text" value="${esc(identified.set || "")}" placeholder="e.g. Topps, Fleer, Upper Deck" autocomplete="off" />
+        </label>
+        ${sportSelectHTML(identified)}
+        <label>What's inside
+          <input id="ed-configuration" type="text" value="${esc(identified.configuration || "")}" placeholder="e.g. 36 packs, 15 cards each" autocomplete="off" />
+        </label>
+        <label>Notes about this product
+          <input id="ed-notable" type="text" value="${esc(identified.notable || "")}" placeholder="e.g. has the MJ rookie" autocomplete="off" />
+        </label>
+        <label class="checkbox">
+          <input id="ed-sealed" type="checkbox" ${identified.sealed ? "checked" : ""} />
+          <span>Appears factory sealed / unopened</span>
+        </label>
+      </div>
+    `;
+  }
   return `
     <p class="edit-title">Edit card details</p>
     <div class="edit-form">
@@ -621,16 +1144,7 @@ function renderEditFormHTML(identified) {
       <label>Team
         <input id="ed-team" type="text" value="${esc(identified.team || "")}" placeholder="e.g. Yankees, Bulls (optional)" autocomplete="off" />
       </label>
-      <label>Sport
-        <select id="ed-sport">
-          ${sports
-            .map(
-              (s) =>
-                `<option value="${s}" ${identified.sport === s ? "selected" : ""}>${s[0].toUpperCase()}${s.slice(1)}</option>`,
-            )
-            .join("")}
-        </select>
-      </label>
+      ${sportSelectHTML(identified)}
       <label class="checkbox">
         <input id="ed-isRookie" type="checkbox" ${identified.isRookie ? "checked" : ""} />
         <span>Rookie card</span>
@@ -643,31 +1157,47 @@ function renderEditFormHTML(identified) {
   `;
 }
 
-function readEditFormValues() {
+function readEditFormValues(itemType = "card") {
   const yearRaw = parseInt(document.getElementById("ed-year").value, 10);
+  const year = Number.isFinite(yearRaw) ? yearRaw : null;
+  const sport = document.getElementById("ed-sport").value;
+  if (itemType === "pack" || itemType === "box") {
+    return {
+      itemLabel: document.getElementById("ed-itemLabel").value.trim(),
+      year,
+      set: document.getElementById("ed-set").value.trim(),
+      sport,
+      configuration: document.getElementById("ed-configuration").value.trim() || null,
+      notable: document.getElementById("ed-notable").value.trim() || null,
+      sealed: document.getElementById("ed-sealed").checked,
+    };
+  }
   return {
     player: document.getElementById("ed-player").value.trim(),
-    year: Number.isFinite(yearRaw) ? yearRaw : null,
+    year,
     set: document.getElementById("ed-set").value.trim(),
     cardNumber: document.getElementById("ed-cardNumber").value.trim(),
     team: document.getElementById("ed-team").value.trim() || null,
-    sport: document.getElementById("ed-sport").value,
+    sport,
     isRookie: document.getElementById("ed-isRookie").checked,
     isHOF: document.getElementById("ed-isHOF").checked,
   };
 }
 
 document.getElementById("rescan-btn").addEventListener("click", () => {
-  state.frontFile = null;
-  state.backFile = null;
-  state.lastIdentified = null;
-  state.notes = "";
-  state.editingResult = false;
-  resultNotesEl.value = "";
-  renderPreviews();
-  document.getElementById("capture-front").value = "";
-  document.getElementById("capture-back").value = "";
-  scanStatus.textContent = "";
+  // In review context this button is "Discard": drop the queued job, then move
+  // on to the next ready card (or back to the camera if none are waiting).
+  if (state.reviewJobId) {
+    const id = state.reviewJobId;
+    state.reviewJobId = null;
+    discardJob(id);
+    resetScanInputs();
+    const next = QUEUE.jobs.find((j) => j.status === "ready");
+    if (next) reviewJob(next.id);
+    else location.hash = "#/scan";
+    return;
+  }
+  resetScanInputs();
   location.hash = "#/scan";
 });
 
@@ -686,6 +1216,7 @@ document.getElementById("save-btn").addEventListener("click", async () => {
     const backUrl = state.backFile ? await uploadImage(state.backFile, cardId, "back") : null;
     await setDoc(doc(db, "users", currentUser.uid, "cards", cardId), {
       createdAt: serverTimestamp(),
+      itemType: state.lastIdentified.itemType || "card",
       imageFrontUrl: frontUrl,
       imageBackUrl: backUrl,
       identified: state.lastIdentified.identified,
@@ -693,19 +1224,25 @@ document.getElementById("save-btn").addEventListener("click", async () => {
       ebayPrices: state.lastIdentified.ebayPrices || null,
       userNotes: state.notes || null,
     });
-    state.frontFile = null;
-    state.backFile = null;
-    state.lastIdentified = null;
-    state.notes = "";
-    state.editingResult = false;
-    resultNotesEl.value = "";
-    location.hash = "#/collection";
+    if (state.reviewJobId) {
+      // Saved a queued card: remove it and step to the next ready one.
+      const saved = QUEUE.jobs.find((j) => j.id === state.reviewJobId);
+      if (saved?.thumbUrl) URL.revokeObjectURL(saved.thumbUrl);
+      QUEUE.jobs = QUEUE.jobs.filter((j) => j.id !== state.reviewJobId);
+      state.reviewJobId = null;
+      renderTray();
+      updateNavBadge();
+      reviewNext();
+    } else {
+      resetScanInputs();
+      location.hash = "#/collection";
+    }
   } catch (err) {
     console.error(err);
     alert("Save failed. Try again.");
   } finally {
     saveBtn.disabled = false;
-    saveBtn.textContent = "Save to collection";
+    syncResultButtons();
   }
 });
 
@@ -725,6 +1262,10 @@ const sortSelectEl = document.getElementById("collection-sort");
 const filtersToggleEl = document.getElementById("filters-toggle");
 const filtersPanelEl = document.getElementById("filters-panel");
 const filterSportEl = document.getElementById("filter-sport");
+const filterItemTypeEl = document.getElementById("filter-itemtype");
+// Declared here (not in the Locations section) so the collection-control wiring
+// below can reference it without hitting a temporal-dead-zone error at load.
+const filterLocationEl = document.getElementById("filter-location");
 const filterRookieEl = document.getElementById("filter-rookie");
 const filterHofEl = document.getElementById("filter-hof");
 const filterYearFromEl = document.getElementById("filter-year-from");
@@ -764,9 +1305,10 @@ function applyFiltersAndSort(cards) {
   const f = collectionFilters;
   const filtered = cards.filter((c) => {
     if (term) {
-      const haystack = `${c.identified?.player || ""} ${c.identified?.year || ""} ${c.identified?.set || ""} ${c.identified?.team || ""}`.toLowerCase();
+      const haystack = `${c.identified?.player || ""} ${c.identified?.itemLabel || ""} ${c.identified?.year || ""} ${c.identified?.set || ""} ${c.identified?.team || ""}`.toLowerCase();
       if (!haystack.includes(term)) return false;
     }
+    if (f.itemType !== "all" && itemTypeOf(c) !== f.itemType) return false;
     if (f.sport !== "all" && c.identified?.sport !== f.sport) return false;
     if (f.location !== "all") {
       // A card counts as "assigned" only if its locationId still resolves to an
@@ -833,7 +1375,11 @@ function renderGroupedHTML(cards) {
   for (const c of cards) {
     const mfr = (c.identified?.set || "").trim() || "(Unknown manufacturer)";
     const year = c.identified?.year || "(Unknown year)";
-    const team = (c.identified?.team || "").trim() || "(Unknown team)";
+    // Cards bucket by team; sealed packs/boxes bucket by their product label.
+    const team =
+      itemTypeOf(c) === "card"
+        ? (c.identified?.team || "").trim() || "(Unknown team)"
+        : (c.identified?.itemLabel || "").trim() || (itemTypeOf(c) === "pack" ? "Sealed packs" : "Sealed boxes");
     if (!groups.has(mfr)) groups.set(mfr, new Map());
     const mfrMap = groups.get(mfr);
     if (!mfrMap.has(year)) mfrMap.set(year, new Map());
@@ -882,10 +1428,10 @@ function renderGroupedHTML(cards) {
                               .map(
                                 (c) => `
                               <a class="collection-card" href="#/detail/${esc(c.id)}">
-                                <img src="${esc(c.imageFrontUrl || "")}" alt="${esc(c.identified?.player || "Card")}" />
+                                <img src="${esc(c.imageFrontUrl || "")}" alt="${esc(displayName(c))}" />
                                 <div class="info">
-                                  <div class="name">${esc(c.identified?.player || "Unknown")}</div>
-                                  <div class="sub">${c.identified?.cardNumber ? `#${esc(c.identified.cardNumber)}` : ""}</div>
+                                  <div class="name">${esc(displayName(c))}</div>
+                                  <div class="sub">${collectionCardSub(c)}</div>
                                   <div class="price">$${fmt(c.valueEstimate?.low || 0)}–$${fmt(c.valueEstimate?.high || 0)}</div>
                                 </div>
                               </a>`,
@@ -921,12 +1467,14 @@ function ensureDemoBanner() {
 
 function clearAllFilters() {
   collectionFilters.sport = "all";
+  collectionFilters.itemType = "all";
   collectionFilters.location = "all";
   collectionFilters.rookieOnly = false;
   collectionFilters.hofOnly = false;
   collectionFilters.yearFrom = null;
   collectionFilters.yearTo = null;
   filterSportEl.value = "all";
+  if (filterItemTypeEl) filterItemTypeEl.value = "all";
   if (filterLocationEl) filterLocationEl.value = "all";
   filterRookieEl.checked = false;
   filterHofEl.checked = false;
@@ -952,6 +1500,12 @@ filterSportEl.addEventListener("change", () => {
   collectionFilters.sport = filterSportEl.value;
   drawCollection();
 });
+if (filterItemTypeEl) {
+  filterItemTypeEl.addEventListener("change", () => {
+    collectionFilters.itemType = filterItemTypeEl.value;
+    drawCollection();
+  });
+}
 if (filterLocationEl) {
   filterLocationEl.addEventListener("change", () => {
     collectionFilters.location = filterLocationEl.value;
@@ -989,21 +1543,28 @@ exportCsvEl.addEventListener("click", () => {
 
 // --- CSV export ------------------------------------------------------------
 function exportCSV(cards) {
-  const headers = ["Player", "Year", "Set", "Card #", "Sport", "Rookie", "HOF", "Value Low", "Value High", "Location", "Notes", "Date Added"];
-  const rows = cards.map((c) => [
-    c.identified?.player || "",
-    c.identified?.year || "",
-    c.identified?.set || "",
-    c.identified?.cardNumber || "",
-    c.identified?.sport || "",
-    c.identified?.isRookie ? "Yes" : "",
-    c.identified?.isHOF ? "Yes" : "",
-    c.valueEstimate?.low || "",
-    c.valueEstimate?.high || "",
-    locationName(c.locationId),
-    (c.userNotes || "").replace(/\r?\n/g, " "),
-    formatDate(c.createdAt),
-  ]);
+  const headers = ["Type", "Name / Player", "Year", "Set", "Card #", "Sport", "Rookie", "HOF", "Sealed", "Configuration", "Value Low", "Value High", "Location", "Notes", "Date Added"];
+  const rows = cards.map((c) => {
+    const t = itemTypeOf(c);
+    const sealed = t === "card" ? "" : c.identified?.sealed ? "Yes" : "";
+    return [
+      t,
+      displayName(c),
+      c.identified?.year || "",
+      c.identified?.set || "",
+      t === "card" ? c.identified?.cardNumber || "" : "",
+      c.identified?.sport || "",
+      c.identified?.isRookie ? "Yes" : "",
+      c.identified?.isHOF ? "Yes" : "",
+      sealed,
+      t === "card" ? "" : c.identified?.configuration || "",
+      c.valueEstimate?.low || "",
+      c.valueEstimate?.high || "",
+      locationName(c.locationId),
+      (c.userNotes || "").replace(/\r?\n/g, " "),
+      formatDate(c.createdAt),
+    ];
+  });
   const csv = [headers, ...rows].map((row) => row.map(csvEscape).join(",")).join("\r\n");
   const blob = new Blob(["﻿" + csv], { type: "text/csv;charset=utf-8;" });
   const url = URL.createObjectURL(blob);
@@ -1084,24 +1645,18 @@ function renderDetailDisplay(el) {
   const uncertain = (c.identified?.confidence || 0) < 0.5 && !c.identified?.userEdited;
 
   el.innerHTML = `
-    ${IS_DEMO ? `<div class="demo-banner">This is a <strong>sample card</strong>. Editing and deleting are disabled in demo mode.</div>` : ""}
-    ${highValue ? `<div class="high-value-banner">This may be a valuable card. Get a professional appraisal before selling.</div>` : ""}
+    ${IS_DEMO ? `<div class="demo-banner">This is a <strong>sample item</strong>. Editing and deleting are disabled in demo mode.</div>` : ""}
+    ${highValue ? `<div class="high-value-banner">This may be valuable. Get a professional appraisal before selling.</div>` : ""}
     ${uncertain ? `<div class="uncertain-banner">The AI wasn't very sure about this one. Tap <strong>Edit details</strong> to correct anything.</div>` : ""}
     <div class="result-card">
-      <p class="player">${esc(c.identified?.player || "Unknown")}</p>
-      <p class="meta">${c.identified?.year || ""} ${esc(c.identified?.set || "")} ${c.identified?.cardNumber ? `#${esc(c.identified.cardNumber)}` : ""} &mdash; ${esc(c.identified?.sport || "")}</p>
-      <div class="badges">
-        ${c.identified?.isRookie ? `<span class="badge rookie">Rookie</span>` : ""}
-        ${c.identified?.isHOF ? `<span class="badge hof">Hall of Fame</span>` : ""}
-        ${typeof c.identified?.confidence === "number" ? `<span class="badge">Confidence ${Math.round(c.identified.confidence * 100)}%</span>` : ""}
-      </div>
+      ${identifiedSummaryHTML(c)}
       <div class="value-block">
         <div class="label muted">Claude AI ballpark</div>
         <div class="range">$${fmt(c.valueEstimate?.low || 0)} &ndash; $${fmt(c.valueEstimate?.high || 0)}</div>
         <div class="note">${esc(c.valueEstimate?.note || "")}</div>
       </div>
       ${renderEbayBlock(c.ebayPrices)}
-      ${renderPriceLinks(c.identified)}
+      ${renderPriceLinks(c)}
     </div>
     ${c.locationId && locationName(c.locationId) ? `<div class="location-display">📍 <strong>Location:</strong> ${esc(locationName(c.locationId))}</div>` : ""}
     ${c.userNotes ? `<div class="notes-display">${esc(c.userNotes)}</div>` : ""}
@@ -1142,11 +1697,15 @@ function renderDetailEditing(el) {
     ),
   ].join("");
 
+  const type = itemTypeOf(c);
   el.innerHTML =
-    renderEditFormHTML(c.identified || {}) +
+    renderEditFormHTML(c.identified || {}, type) +
     `<div class="notes-section">
-       <label for="detail-location">Location</label>
-       <select id="detail-location" class="control-select">${locationOptions}</select>
+       <label for="detail-location">Location <span class="muted">(where it's stored)</span></label>
+       <div class="location-pick">
+         <select id="detail-location" class="control-select">${locationOptions}</select>
+         <button type="button" id="detail-new-location" class="control-btn">+ New</button>
+       </div>
        <a class="link-button" href="#/locations">Manage locations</a>
      </div>
      <div class="notes-section">
@@ -1158,11 +1717,41 @@ function renderDetailEditing(el) {
        <button id="detail-cancel-btn" class="big-button">Cancel</button>
      </div>`;
 
+  // Inline location creation — make a new storage location and assign it without
+  // leaving the page or losing the other edits in this form.
+  document.getElementById("detail-new-location").addEventListener("click", async () => {
+    if (IS_DEMO || !currentUser) {
+      alert("Sign in to add locations.");
+      return;
+    }
+    const raw = prompt('New location name (e.g. "Binder A — Page 3")');
+    if (raw == null) return;
+    const name = raw.trim();
+    if (!name) return;
+    try {
+      const id = crypto.randomUUID();
+      await setDoc(doc(db, "users", currentUser.uid, "locations", id), {
+        name,
+        createdAt: serverTimestamp(),
+      });
+      locationsCache.push({ id, name });
+      const sel = document.getElementById("detail-location");
+      const opt = document.createElement("option");
+      opt.value = id;
+      opt.textContent = name;
+      sel.appendChild(opt);
+      sel.value = id;
+    } catch (err) {
+      console.error(err);
+      alert("Couldn't add that location. Try again.");
+    }
+  });
+
   document.getElementById("detail-apply-btn").addEventListener("click", async () => {
     const applyBtn = document.getElementById("detail-apply-btn");
     applyBtn.disabled = true;
     applyBtn.textContent = "Saving...";
-    const updatedIdentified = { ...c.identified, ...readEditFormValues(), userEdited: true };
+    const updatedIdentified = { ...c.identified, ...readEditFormValues(type), userEdited: true };
     const updatedNotes = document.getElementById("detail-notes").value;
     const updatedLocationId = document.getElementById("detail-location").value || null;
     try {
@@ -1196,7 +1785,7 @@ const locationsListEl = document.getElementById("locations-list");
 const locationsEmptyEl = document.getElementById("locations-empty");
 const locationAddForm = document.getElementById("location-add-form");
 const locationAddInput = document.getElementById("location-add-input");
-const filterLocationEl = document.getElementById("filter-location");
+// filterLocationEl is declared up with the other filter refs (see Collection view).
 
 async function loadLocations() {
   if (IS_DEMO || !currentUser) {
@@ -1377,11 +1966,18 @@ function renderEbayBlock(ebay) {
 // Build a row of "Compare on" links to external pricing sources we can't
 // scrape (anti-bot protection, paid APIs, etc.) — just send the user to a
 // pre-filled search URL on each site. Returns "" if no card to look up.
-function renderPriceLinks(identified) {
-  if (!identified || !identified.player || identified.player === "Unknown card") return "";
-  const query = [identified.year, identified.set, identified.player, identified.cardNumber]
-    .filter(Boolean)
-    .join(" ");
+function renderPriceLinks(data) {
+  const identified = data?.identified || {};
+  const t = itemTypeOf(data);
+  let parts;
+  if (t === "pack" || t === "box") {
+    if (!identified.itemLabel || /^unknown/i.test(identified.itemLabel)) return "";
+    parts = [identified.year, identified.set, identified.itemLabel, "sealed"];
+  } else {
+    if (!identified.player || identified.player === "Unknown card") return "";
+    parts = [identified.year, identified.set, identified.player, identified.cardNumber];
+  }
+  const query = parts.filter(Boolean).join(" ");
   if (!query.trim()) return "";
   const q = encodeURIComponent(query);
   // Sites are independently URL-encoded; some accept + or %20 — both work.
@@ -1414,17 +2010,24 @@ function capSport(s) {
 // --- eBay listing generator ------------------------------------------------
 function ebayTitle(c) {
   const id = c.identified || {};
+  const t = itemTypeOf(c);
   const parts = [];
   if (id.year) parts.push(String(id.year));
   if (id.set) parts.push(id.set);
-  if (id.player) parts.push(id.player);
-  if (id.cardNumber) parts.push(`#${id.cardNumber}`);
-  if (id.team) parts.push(id.team);
-  if (id.sport) parts.push(capSport(id.sport));
-  if (id.isRookie) parts.push("ROOKIE RC");
-  if (id.isHOF) parts.push("HOF");
+  if (t === "pack" || t === "box") {
+    if (id.sport) parts.push(capSport(id.sport));
+    if (id.itemLabel) parts.push(id.itemLabel);
+    if (id.sealed) parts.push("SEALED UNOPENED");
+  } else {
+    if (id.player) parts.push(id.player);
+    if (id.cardNumber) parts.push(`#${id.cardNumber}`);
+    if (id.team) parts.push(id.team);
+    if (id.sport) parts.push(capSport(id.sport));
+    if (id.isRookie) parts.push("ROOKIE RC");
+    if (id.isHOF) parts.push("HOF");
+  }
   let title = parts.join(" ").trim();
-  if (!title) title = "Sports card";
+  if (!title) title = t === "pack" ? "Sealed card pack" : t === "box" ? "Sealed card box" : "Sports card";
   if (title.length > 80) title = title.slice(0, 77).trimEnd() + "...";
   return title;
 }
@@ -1432,36 +2035,65 @@ function ebayTitle(c) {
 function ebayDescription(c) {
   const id = c.identified || {};
   const val = c.valueEstimate || {};
+  const t = itemTypeOf(c);
   const lines = [];
 
-  const header = [id.year, id.set, id.player].filter(Boolean).join(" ");
-  if (header) lines.push(header);
+  if (t === "pack" || t === "box") {
+    const header = [id.year, id.set, id.itemLabel].filter(Boolean).join(" ");
+    if (header) lines.push(header);
+    const meta = [];
+    if (id.sport) meta.push(capSport(id.sport));
+    if (id.configuration) meta.push(id.configuration);
+    if (meta.length) lines.push(meta.join(" • "));
+    lines.push("");
 
-  const meta = [];
-  if (id.cardNumber) meta.push(`Card #${id.cardNumber}`);
-  if (id.team) meta.push(id.team);
-  if (id.sport) meta.push(capSport(id.sport));
-  if (meta.length) lines.push(meta.join(" • "));
-  lines.push("");
+    const highlights = [];
+    if (id.sealed) highlights.push("Appears factory sealed / unopened");
+    if (typeof id.year === "number") {
+      if (id.year < 1980) highlights.push("Vintage sealed product");
+      else if (id.year <= 1995) highlights.push("Vintage / junk-wax-era product");
+    }
+    if (id.notable) highlights.push(id.notable);
+    if (highlights.length) {
+      lines.push("Highlights:");
+      for (const h of highlights) lines.push(`- ${h}`);
+      lines.push("");
+    }
 
-  const highlights = [];
-  if (id.isRookie) highlights.push("Rookie card (RC)");
-  if (id.isHOF) highlights.push("Hall of Fame player");
-  if (typeof id.year === "number") {
-    if (id.year < 1946) highlights.push("Pre-war vintage");
-    else if (id.year <= 1980) highlights.push("Vintage");
-  }
-  if (highlights.length) {
-    lines.push("Highlights:");
-    for (const h of highlights) lines.push(`- ${h}`);
+    lines.push("CONDITION & AUTHENTICITY:");
+    lines.push(
+      "This sealed product has NOT been independently authenticated. Please review all photos carefully and judge the seal and condition for yourself before bidding. Sold as-is from a personal collection.",
+    );
+    lines.push("");
+  } else {
+    const header = [id.year, id.set, id.player].filter(Boolean).join(" ");
+    if (header) lines.push(header);
+    const meta = [];
+    if (id.cardNumber) meta.push(`Card #${id.cardNumber}`);
+    if (id.team) meta.push(id.team);
+    if (id.sport) meta.push(capSport(id.sport));
+    if (meta.length) lines.push(meta.join(" • "));
+    lines.push("");
+
+    const highlights = [];
+    if (id.isRookie) highlights.push("Rookie card (RC)");
+    if (id.isHOF) highlights.push("Hall of Fame player");
+    if (typeof id.year === "number") {
+      if (id.year < 1946) highlights.push("Pre-war vintage");
+      else if (id.year <= 1980) highlights.push("Vintage");
+    }
+    if (highlights.length) {
+      lines.push("Highlights:");
+      for (const h of highlights) lines.push(`- ${h}`);
+      lines.push("");
+    }
+
+    lines.push("CONDITION:");
+    lines.push(
+      "This card has NOT been professionally graded. Please review all photos carefully to assess condition before bidding. Sold as-is from a personal collection.",
+    );
     lines.push("");
   }
-
-  lines.push("CONDITION:");
-  lines.push(
-    "This card has NOT been professionally graded. Please review all photos carefully to assess condition before bidding. Sold as-is from a personal collection.",
-  );
-  lines.push("");
 
   if (val.low || val.high) {
     lines.push(
@@ -1475,7 +2107,7 @@ function ebayDescription(c) {
     lines.push("");
   }
 
-  lines.push("Combined shipping available on multiple-card purchases. Message with any questions before bidding.");
+  lines.push("Combined shipping available on multiple purchases. Message with any questions before bidding.");
 
   return lines.join("\n").trim();
 }
@@ -1497,8 +2129,16 @@ function ebaySectionHTML(c) {
           <button class="copy-btn" data-copy-target="#ebay-title-${slug}">Copy title</button>
         </div>
         <div class="ebay-field">
-          <div class="ebay-field-label"><span>Description</span></div>
-          <textarea id="ebay-desc-${slug}" readonly>${esc(desc)}</textarea>
+          <div class="ebay-field-label">
+            <span>Description</span>
+            <span class="ebay-field-hint">editable</span>
+          </div>
+          <textarea id="ebay-desc-${slug}">${esc(desc)}</textarea>
+          <div class="ebay-ai-row">
+            <button type="button" class="control-btn ai-listing-btn" data-ai-slug="${slug}" data-ai-target="#ebay-desc-${slug}">✦ Write a better description with AI</button>
+            <span class="ai-listing-status" id="ai-listing-status-${slug}" aria-live="polite"></span>
+          </div>
+          <p class="ebay-ai-hint muted">Researches the item online and writes a professional, sales-focused description. Edit it after.</p>
           <button class="copy-btn" data-copy-target="#ebay-desc-${slug}">Copy description</button>
         </div>
       </div>
@@ -1534,17 +2174,17 @@ async function copyToClipboard(text, btn) {
   }, 1500);
 }
 
-// Refresh just the inner content of the result-view eBay section so live
-// edits to the notes textarea (or the inline edit form) reflect immediately.
+// Refresh just the eBay title on the result view when notes change. The
+// description is now editable / AI-fillable, so we deliberately leave it alone
+// rather than overwriting any edits the user (or the AI) made.
 function refreshResultEbayContent() {
   if (!state.lastIdentified) return;
-  const existing = document.querySelector("#result-card .ebay-section .ebay-content");
-  if (!existing) return;
+  const titleInput = document.querySelector('#result-card .ebay-section input[id^="ebay-title-"]');
+  if (!titleInput) return;
   const cardData = { ...state.lastIdentified, userNotes: state.notes };
-  const wrapper = document.createElement("div");
-  wrapper.innerHTML = ebaySectionHTML(cardData);
-  const newContent = wrapper.querySelector(".ebay-content");
-  if (newContent) existing.innerHTML = newContent.innerHTML;
+  titleInput.value = ebayTitle(cardData);
+  const hint = titleInput.closest(".ebay-field")?.querySelector(".ebay-field-hint");
+  if (hint) hint.textContent = `${titleInput.value.length}/80 chars`;
 }
 
 // Event delegation for all copy buttons (result view + detail view).
@@ -1554,6 +2194,72 @@ document.addEventListener("click", async (e) => {
   const target = document.querySelector(btn.dataset.copyTarget);
   if (!target) return;
   await copyToClipboard(target.value, btn);
+});
+
+// --- AI eBay description ----------------------------------------------------
+async function generateListingDescription(data) {
+  if (USE_MOCK_AI || !FIREBASE_READY || !currentUser) {
+    await new Promise((r) => setTimeout(r, 700));
+    return mockListing(data);
+  }
+  const callable = httpsCallable(functions, "generateListing");
+  const res = await callable({
+    itemType: itemTypeOf(data),
+    identified: data.identified,
+    valueEstimate: data.valueEstimate,
+    userNotes: data.userNotes || null,
+  });
+  return res.data.description;
+}
+
+function mockListing(data) {
+  const id = data.identified || {};
+  const name = displayName(data);
+  const header = [id.year, id.set].filter(Boolean).join(" ");
+  return (
+    `${name}${header ? ` — ${header}` : ""}\n\n` +
+    `(Demo sample — the live app researches the item online and writes a real, professional description here.) ` +
+    `A standout piece from a personal collection that collectors of this era actively seek out. ` +
+    `Please review all photos closely and judge the condition for yourself — this item is raw/ungraded and sold as-is. ` +
+    `Combined shipping is available. Message with any questions before bidding.`
+  );
+}
+
+// Event delegation for the "Write with AI" buttons (result + detail views).
+document.addEventListener("click", async (e) => {
+  const btn = e.target.closest(".ai-listing-btn");
+  if (!btn) return;
+  const slug = btn.dataset.aiSlug;
+  const target = document.querySelector(btn.dataset.aiTarget);
+  if (!target) return;
+
+  let data;
+  if (slug === "result" && state.lastIdentified) {
+    data = { ...state.lastIdentified, userNotes: state.notes };
+  } else if (detailState.card) {
+    data = detailState.card;
+  } else {
+    return;
+  }
+
+  const statusEl = document.getElementById(`ai-listing-status-${slug}`);
+  const orig = btn.textContent;
+  btn.disabled = true;
+  btn.textContent = "Writing…";
+  if (statusEl) statusEl.textContent = "Researching the item and writing…";
+  try {
+    target.value = await generateListingDescription(data);
+    if (statusEl) statusEl.textContent = "Done — edit it however you like.";
+  } catch (err) {
+    console.error("generateListing failed", err);
+    if (statusEl) statusEl.textContent = "Couldn't write one just now. Try again.";
+  } finally {
+    btn.disabled = false;
+    btn.textContent = orig;
+    setTimeout(() => {
+      if (statusEl) statusEl.textContent = "";
+    }, 5000);
+  }
 });
 
 // --- Boot ------------------------------------------------------------------

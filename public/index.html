@@ -27,9 +27,27 @@
     <!-- Scan view -->
     <section class="view" data-view="scan">
       <div class="scan-hero">
-        <h2>Scan a card</h2>
-        <p class="muted">Tap <strong>Open camera</strong>, fill the frame with the card, then tap <strong>Capture</strong>. Good light helps.</p>
+        <h2>Scan an item</h2>
+        <p class="muted">Tap <strong>Open camera</strong>, fill the frame with the item, then tap <strong>Capture</strong>. Good light helps.</p>
       </div>
+
+      <div class="itemtype-select" role="group" aria-label="What are you scanning?">
+        <span class="itemtype-label">Scanning a</span>
+        <div class="itemtype-btns">
+          <button type="button" class="itemtype-btn active" data-itemtype="card">Single card</button>
+          <button type="button" class="itemtype-btn" data-itemtype="pack">Sealed pack</button>
+          <button type="button" class="itemtype-btn" data-itemtype="box">Sealed box</button>
+        </div>
+      </div>
+
+      <label class="bulk-toggle">
+        <input type="checkbox" id="bulk-toggle" />
+        <span class="bulk-toggle-track"><span class="bulk-toggle-thumb"></span></span>
+        <span class="bulk-toggle-label">
+          <strong>Bulk mode</strong>
+          <small>Keep the camera open and snap card after card &mdash; each one identifies in the background, then waits for you to review.</small>
+        </span>
+      </label>
 
       <div id="camera-stage" class="camera-stage" hidden>
         <video id="camera-video" playsinline muted autoplay></video>
@@ -44,8 +62,8 @@
         <summary>Camera not working? Upload a photo instead</summary>
         <div class="camera-fallback-body">
           <label class="big-button">
-            Choose front photo
-            <input id="capture-front" type="file" accept="image/*" capture="environment" hidden />
+            Choose front photo(s)
+            <input id="capture-front" type="file" accept="image/*" capture="environment" multiple hidden />
           </label>
           <label class="big-button">
             Choose back photo (optional)
@@ -54,11 +72,17 @@
         </div>
       </details>
 
+      <!-- Single-mode "wait or move on" panel, shown after a capture -->
+      <div id="scan-processing" class="scan-processing" hidden></div>
+
       <div id="scan-previews" class="previews"></div>
 
       <button id="identify-btn" class="big-button primary" hidden disabled>Identify card</button>
 
       <p id="scan-status" class="status" aria-live="polite"></p>
+
+      <!-- Background scan queue / review tray -->
+      <div id="scan-queue" class="scan-queue" hidden></div>
 
       <div class="scan-mark" aria-hidden="true">
         <img src="icons/icon-512.png" alt="" width="220" height="220" />
@@ -101,6 +125,14 @@
       </div>
       <div id="filters-panel" class="filters-panel" hidden>
         <div class="filters-row">
+          <label class="filter-field">Type
+            <select id="filter-itemtype">
+              <option value="all">All items</option>
+              <option value="card">Single cards</option>
+              <option value="pack">Sealed packs</option>
+              <option value="box">Sealed boxes</option>
+            </select>
+          </label>
           <label class="filter-field">Sport
             <select id="filter-sport">
               <option value="all">All sports</option>

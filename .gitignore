@@ -6,3 +6,4 @@ Thumbs.db
 .env
 .env.local
 functions/node_modules/
+.claude/

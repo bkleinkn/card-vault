@@ -89,9 +89,10 @@ users/{uid}
 
 users/{uid}/cards/{cardId}
   createdAt
+  itemType         // "card" | "pack" | "box"  (missing ⇒ treat as "card")
   imageFrontUrl
   imageBackUrl?
-  identified: {
+  identified: {    // CARD shape (PACK/BOX use itemLabel/configuration/sealed/notable instead of player/cardNumber/team/isRookie/isHOF)
     sport          // "baseball"
     year           // 1952
     set            // "Topps"          ← grouped as "Manufacturer" in UI
@@ -110,10 +111,17 @@ users/{uid}/cards/{cardId}
     estimatedAt
   }
   userNotes?       // free text
+  locationId?      // → users/{uid}/locations/{id}
   conditionGuess?  // user-entered string for v1; AI-graded later
 ```
 
-The collection view groups cards as **Manufacturer (set) → Year → Team** via nested `<details>` elements — the primary browse pattern for working through an inherited collection. Search / sort / sport / Rookie / HOF / year-range filters narrow the cards that get bucketed into the groups.
+The collection view groups items as **Manufacturer (set) → Year → Team** via nested `<details>` elements — the primary browse pattern for working through an inherited collection. Sealed packs/boxes have no team, so they bucket under their `itemLabel` at that level. Search / sort / **type (card/pack/box)** / sport / Rookie / HOF / year-range filters narrow what gets bucketed.
+
+**Three item types.** The scan view has a Card / Pack / Box selector; the chosen type tags every capture and is passed to `identifyCard`, which switches to a type-specific prompt + JSON schema. Result/detail/collection/CSV/edit-form/eBay-listing all branch on `itemType` via shared helpers (`itemTypeOf`, `displayName`, `identifiedSummaryHTML`, `renderEditFormHTML`).
+
+**AI eBay descriptions.** The "Generate eBay listing" panel has a "✦ Write a better description with AI" button → `generateListing` Cloud Function (Opus 4.8 + `web_search_20260209`) returns a researched, sales-oriented description (editable, templated fallback already in the box). Gated through `generateListingDescription()`, which returns a mock when `USE_MOCK_AI`.
+
+**Inline locations.** The card detail edit form has a "+ New" button next to the Location select that creates a storage location (writes `users/{uid}/locations/{id}`) and assigns it without leaving the page.
 
 ## File layout
 
@@ -141,7 +149,7 @@ card-vault/
   functions/
     package.json               (@anthropic-ai/sdk)
     package-lock.json
-    index.js                   (identifyCard onCall, Opus 4.7, adaptive thinking)
+    index.js                   (identifyCard onCall — Opus 4.7, branches by itemType card/pack/box; generateListing onCall — Opus 4.8 + web_search, AI eBay descriptions)
   scripts/
     generate-icons.mjs         (npm run icons — SVG→PNG, legacy)
     import-icon.mjs            (npm run icon:import — chroma-key + resize)
@@ -159,7 +167,9 @@ card-vault/
 
 **Phase 4 (polish) — DONE.** High-value flagging, totals, edit flow, notes, confidence-aware copy, CSV export, full search/sort/filter, Manufacturer→Year→Team hierarchical collection grouping, eBay listing generator with 1-click copy, custom Card Vault icon (transparent-cornered, also displayed in scan view), Cosmic Slate dark reskin (Inter + JetBrains Mono, slate-950 canvas, indigo accent, top gradient strip, glassmorphism). Network-first SW + auto-reload on update so deploys propagate to existing tabs within ~60s.
 
-**Phase 5+ (deferred features)** — real pricing data, condition grading, batch scan, selling assistance, custom domain, etc.
+**Phase 5 (item types + AI listings + background scanning) — CODE DONE, NEEDS DEPLOY.** Background scan queue with a review tray + Bulk mode (capture many, identify in background, review before save). Card / Pack / Box item types end-to-end. AI-written eBay descriptions via `generateListing`. Inline location creation on the detail page. Verified locally with `USE_MOCK_AI`. **To go live:** `firebase deploy --only functions --project=card-vault-d8fa4` (picks up `generateListing` + the pack/box prompts) **and** `firebase deploy --only hosting --project=card-vault-d8fa4` (client). The AI description and pack/box identify won't work until functions are deployed.
+
+**Phase 6+ (deferred features)** — real pricing data, condition grading, selling assistance, custom domain, etc.
 
 ## Operational notes
 

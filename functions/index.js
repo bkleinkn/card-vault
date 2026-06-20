@@ -14,8 +14,13 @@ admin.initializeApp();
 
 const ANTHROPIC_API_KEY = defineSecret("ANTHROPIC_API_KEY");
 
-const IDENTIFY_PROMPT = `
-You are a vintage sports card expert. The user has photographed a sports card.
+// --- Identify prompts & schemas --------------------------------------------
+// Three item types share one Cloud Function. Each gets its own frozen system
+// prompt (cached) and a structured-output schema so Claude returns exactly the
+// shape the client expects with no prose or markdown fences.
+
+const CARD_PROMPT = `
+You are a vintage sports card expert. The user has photographed a single sports card.
 Identify it as accurately as possible. Lean conservative on confidence.
 
 Return JSON ONLY in this exact shape (no prose, no markdown fences):
@@ -41,19 +46,68 @@ Return JSON ONLY in this exact shape (no prose, no markdown fences):
 If you can't identify the card with at least 0.3 confidence, set player to "Unknown card" and confidence to 0.
 `.trim();
 
-// JSON schema for output_config.format — guarantees Claude returns this exact
-// shape with no markdown fences and no extra fields. `additionalProperties:
-// false` is required by the structured-outputs spec.
-const IDENTIFY_SCHEMA = {
+const PACK_PROMPT = `
+You are a vintage sports card expert. The user has photographed a SEALED PACK of sports cards
+(a wax pack, cello pack, rack pack, foil pack, jumbo pack, etc.) — NOT a single card.
+Identify the product as accurately as possible. Lean conservative on confidence.
+
+Return JSON ONLY in this exact shape (no prose, no markdown fences):
+{
+  "identified": {
+    "sport": "baseball|football|basketball|hockey|other",
+    "year": <number or null>,
+    "set": "<manufacturer/brand/set, e.g. 'Topps', 'Fleer', 'Upper Deck'>",
+    "itemLabel": "<short product label, e.g. 'Wax Pack', 'Cello Pack', 'Rack Pack', 'Foil Pack', 'Jumbo Pack'>",
+    "configuration": "<what's inside if known, e.g. '15 cards + 1 stick of gum', or null>",
+    "sealed": <true|false — does it appear factory sealed / unopened>,
+    "notable": "<one short sentence on notable rookies/cards possible in this set or why it's collectible, or null>",
+    "confidence": <number 0..1>
+  },
+  "valueEstimate": {
+    "low": <number, USD, ballpark for a sealed/unopened pack>,
+    "high": <number, USD>,
+    "note": "Rough estimate for a sealed pack. Authenticity and seal matter a lot — verify with recent eBay sold listings."
+  }
+}
+
+If you can't identify the pack with at least 0.3 confidence, set itemLabel to "Unknown pack" and confidence to 0.
+`.trim();
+
+const BOX_PROMPT = `
+You are a vintage sports card expert. The user has photographed a SEALED BOX of sports cards
+(a wax box, hobby box, blaster box, jumbo box, rack box, cello box, etc.) — NOT a single card or pack.
+Identify the product as accurately as possible. Lean conservative on confidence.
+
+Return JSON ONLY in this exact shape (no prose, no markdown fences):
+{
+  "identified": {
+    "sport": "baseball|football|basketball|hockey|other",
+    "year": <number or null>,
+    "set": "<manufacturer/brand/set, e.g. 'Topps', 'Fleer', 'Upper Deck'>",
+    "itemLabel": "<short product label, e.g. 'Wax Box', 'Hobby Box', 'Blaster Box', 'Jumbo Box', 'Rack Box'>",
+    "configuration": "<pack/card layout if known, e.g. '36 wax packs, 15 cards each', or null>",
+    "sealed": <true|false — does it appear factory sealed / unopened>,
+    "notable": "<one short sentence on notable rookies/cards possible in this set or why it's collectible, or null>",
+    "confidence": <number 0..1>
+  },
+  "valueEstimate": {
+    "low": <number, USD, ballpark for a sealed/unopened box>,
+    "high": <number, USD>,
+    "note": "Rough estimate for a sealed box. Authenticity and seal matter a lot — verify with recent eBay sold listings."
+  }
+}
+
+If you can't identify the box with at least 0.3 confidence, set itemLabel to "Unknown box" and confidence to 0.
+`.trim();
+
+// `additionalProperties: false` is required by the structured-outputs spec.
+const CARD_SCHEMA = {
   type: "object",
   properties: {
     identified: {
       type: "object",
       properties: {
-        sport: {
-          type: "string",
-          enum: ["baseball", "football", "basketball", "hockey", "other"],
-        },
+        sport: { type: "string", enum: ["baseball", "football", "basketball", "hockey", "other"] },
         year: { type: ["number", "null"] },
         set: { type: "string" },
         player: { type: "string" },
@@ -63,26 +117,12 @@ const IDENTIFY_SCHEMA = {
         isHOF: { type: "boolean" },
         confidence: { type: "number" },
       },
-      required: [
-        "sport",
-        "year",
-        "set",
-        "player",
-        "cardNumber",
-        "team",
-        "isRookie",
-        "isHOF",
-        "confidence",
-      ],
+      required: ["sport", "year", "set", "player", "cardNumber", "team", "isRookie", "isHOF", "confidence"],
       additionalProperties: false,
     },
     valueEstimate: {
       type: "object",
-      properties: {
-        low: { type: "number" },
-        high: { type: "number" },
-        note: { type: "string" },
-      },
+      properties: { low: { type: "number" }, high: { type: "number" }, note: { type: "string" } },
       required: ["low", "high", "note"],
       additionalProperties: false,
     },
@@ -91,43 +131,75 @@ const IDENTIFY_SCHEMA = {
   additionalProperties: false,
 };
 
+// Packs and boxes share one schema shape (the prompts differ).
+function sealedSchema() {
+  return {
+    type: "object",
+    properties: {
+      identified: {
+        type: "object",
+        properties: {
+          sport: { type: "string", enum: ["baseball", "football", "basketball", "hockey", "other"] },
+          year: { type: ["number", "null"] },
+          set: { type: "string" },
+          itemLabel: { type: "string" },
+          configuration: { type: ["string", "null"] },
+          sealed: { type: "boolean" },
+          notable: { type: ["string", "null"] },
+          confidence: { type: "number" },
+        },
+        required: ["sport", "year", "set", "itemLabel", "configuration", "sealed", "notable", "confidence"],
+        additionalProperties: false,
+      },
+      valueEstimate: {
+        type: "object",
+        properties: { low: { type: "number" }, high: { type: "number" }, note: { type: "string" } },
+        required: ["low", "high", "note"],
+        additionalProperties: false,
+      },
+    },
+    required: ["identified", "valueEstimate"],
+    additionalProperties: false,
+  };
+}
+
+function promptAndSchema(itemType) {
+  if (itemType === "pack") return { prompt: PACK_PROMPT, schema: sealedSchema(), label: "pack" };
+  if (itemType === "box") return { prompt: BOX_PROMPT, schema: sealedSchema(), label: "box" };
+  return { prompt: CARD_PROMPT, schema: CARD_SCHEMA, label: "card" };
+}
+
+function cleanApiKey() {
+  // Strip a leading BOM (U+FEFF) and stray whitespace that can sneak into the
+  // secret when pasted/saved on Windows — otherwise the SDK rejects it as
+  // "not a legal HTTP header value".
+  return ANTHROPIC_API_KEY.value().replace(/^﻿/, "").trim();
+}
+
 exports.identifyCard = onCall(
   { secrets: [ANTHROPIC_API_KEY], cors: true, region: "us-central1" },
   async (request) => {
     if (!request.auth) {
       throw new HttpsError("unauthenticated", "Sign in required.");
     }
-    const { frontImageBase64, backImageBase64 } = request.data || {};
+    const { frontImageBase64, backImageBase64, itemType } = request.data || {};
     if (!frontImageBase64) {
       throw new HttpsError("invalid-argument", "frontImageBase64 is required.");
     }
 
-    // Strip a leading BOM (U+FEFF) and any stray whitespace/newlines that can
-    // sneak into the secret when it's pasted/saved on Windows — otherwise the
-    // SDK rejects the value as "not a legal HTTP header value".
-    const apiKey = ANTHROPIC_API_KEY.value().replace(/^﻿/, "").trim();
-    const client = new Anthropic({ apiKey });
+    const type = itemType === "pack" || itemType === "box" ? itemType : "card";
+    const { prompt, schema, label } = promptAndSchema(type);
 
-    // Build the user turn: instruction text + image(s).
+    const client = new Anthropic({ apiKey: cleanApiKey() });
+
     const userContent = [
-      { type: "text", text: "Identify this card. Respond with JSON only." },
-      {
-        type: "image",
-        source: {
-          type: "base64",
-          media_type: "image/jpeg",
-          data: frontImageBase64,
-        },
-      },
+      { type: "text", text: `Identify this ${label}. Respond with JSON only.` },
+      { type: "image", source: { type: "base64", media_type: "image/jpeg", data: frontImageBase64 } },
     ];
     if (backImageBase64) {
       userContent.push({
         type: "image",
-        source: {
-          type: "base64",
-          media_type: "image/jpeg",
-          data: backImageBase64,
-        },
+        source: { type: "base64", media_type: "image/jpeg", data: backImageBase64 },
       });
     }
 
@@ -136,32 +208,18 @@ exports.identifyCard = onCall(
       response = await client.messages.create({
         model: "claude-opus-4-7",
         max_tokens: 16000,
-        // Adaptive thinking lets Claude reason about ambiguous cards (year
-        // differences, off-grade scans) before committing to an answer.
         thinking: { type: "adaptive" },
-        // Structured output — the API enforces this schema; the model
-        // cannot return prose, markdown fences, or extra fields.
-        output_config: {
-          format: { type: "json_schema", schema: IDENTIFY_SCHEMA },
-        },
-        // System prompt wrapped with cache_control so Anthropic caches it
-        // across every scan (~90% cost reduction on the cached portion).
-        // IDENTIFY_PROMPT is frozen content — cache hits from scan 2 onward.
-        system: [
-          {
-            type: "text",
-            text: IDENTIFY_PROMPT,
-            cache_control: { type: "ephemeral" },
-          },
-        ],
+        output_config: { format: { type: "json_schema", schema } },
+        // Frozen per-type prompt, cached across scans (~90% cost cut on the
+        // cached portion). Each item type keys its own cache entry.
+        system: [{ type: "text", text: prompt, cache_control: { type: "ephemeral" } }],
         messages: [{ role: "user", content: userContent }],
       });
     } catch (err) {
       console.error("Anthropic API call failed:", err);
-      throw new HttpsError("internal", "Could not identify card. Try again.");
+      throw new HttpsError("internal", `Could not identify ${label}. Try again.`);
     }
 
-    // output_config.format guarantees the first text block holds valid JSON.
     const textBlock = response.content.find((b) => b.type === "text");
     if (!textBlock) {
       console.error("No text block in response:", JSON.stringify(response));
@@ -176,22 +234,122 @@ exports.identifyCard = onCall(
       throw new HttpsError("internal", "Model returned invalid JSON.");
     }
 
+    parsed.itemType = type;
     if (parsed.valueEstimate) {
       parsed.valueEstimate.estimatedAt = new Date().toISOString();
     }
 
-    // After Claude identifies the card, scrape eBay's sold-listings page for
-    // real recent sales. Second pricing source, free, no API key needed.
-    // Fails gracefully — null result if blocked or HTML changes, in which case
-    // the client just shows Claude's ballpark alone.
-    const ident = parsed.identified;
-    if (ident && ident.player && ident.player !== "Unknown card") {
-      const queryParts = [ident.year, ident.set, ident.player, ident.cardNumber].filter(Boolean);
-      const ebayQuery = queryParts.join(" ");
-      parsed.ebayPrices = await fetchEbaySoldPrices(ebayQuery);
+    // Real recent eBay sold prices as a second source. Query differs by type.
+    const ident = parsed.identified || {};
+    let queryParts;
+    if (type === "card") {
+      queryParts = ident.player && ident.player !== "Unknown card"
+        ? [ident.year, ident.set, ident.player, ident.cardNumber]
+        : null;
+    } else {
+      const known = ident.itemLabel && !/^unknown/i.test(ident.itemLabel);
+      queryParts = known ? [ident.year, ident.set, ident.itemLabel, "sealed"] : null;
+    }
+    if (queryParts) {
+      parsed.ebayPrices = await fetchEbaySoldPrices(queryParts.filter(Boolean).join(" "));
     }
 
     return parsed;
+  },
+);
+
+// --- AI eBay listing description -------------------------------------------
+// Writes a professional, sales-oriented description for one item, using web
+// search so it can ground the copy in what's actually known/collectible about
+// the card, pack, or box (set significance, notable rookies, demand) rather
+// than emitting a generic template. Returns plain prose the user can edit.
+const LISTING_SYSTEM = `
+You are an expert sports-card seller who writes eBay listing descriptions that sell.
+You write accurate, engaging, professional descriptions that build buyer confidence and interest.
+
+Rules you MUST follow:
+- Be specific and informative about the item: who/what it is, the set, the year, and why a collector would want it.
+- Use web search to ground the description in real, current facts about the player, set, or product
+  (significance, notable rookies/cards, why it's collectible, general market interest). Do NOT invent or
+  promise specific prices, grades, or sales — the seller verifies pricing separately.
+- The item is RAW / UNGRADED and sold as-is from a personal collection. Always tell buyers to review the
+  photos carefully to judge condition themselves. Do not claim or guarantee a condition or authenticity grade.
+- Encourage interest honestly — highlight genuine desirability, but never overstate, fabricate, or mislead.
+- Write in clean paragraphs (and a short bulleted highlights list when useful). No markdown headers, no emojis.
+- Output ONLY the finished description text. No preamble, no "Here is", no surrounding quotes.
+`.trim();
+
+exports.generateListing = onCall(
+  { secrets: [ANTHROPIC_API_KEY], cors: true, region: "us-central1", timeoutSeconds: 120 },
+  async (request) => {
+    if (!request.auth) {
+      throw new HttpsError("unauthenticated", "Sign in required.");
+    }
+    const { itemType, identified, valueEstimate, userNotes } = request.data || {};
+    if (!identified) {
+      throw new HttpsError("invalid-argument", "identified is required.");
+    }
+    const type = itemType === "pack" || itemType === "box" ? itemType : "card";
+
+    // Compact, factual summary of what the user has, for the model to expand on.
+    const facts = [];
+    facts.push(`Item type: ${type}`);
+    if (identified.year) facts.push(`Year: ${identified.year}`);
+    if (identified.set) facts.push(`Set/Brand: ${identified.set}`);
+    if (identified.sport) facts.push(`Sport: ${identified.sport}`);
+    if (type === "card") {
+      if (identified.player) facts.push(`Player: ${identified.player}`);
+      if (identified.cardNumber) facts.push(`Card number: ${identified.cardNumber}`);
+      if (identified.team) facts.push(`Team: ${identified.team}`);
+      if (identified.isRookie) facts.push("This is a ROOKIE card.");
+      if (identified.isHOF) facts.push("Player is a Hall of Famer.");
+    } else {
+      if (identified.itemLabel) facts.push(`Product: ${identified.itemLabel}`);
+      if (identified.configuration) facts.push(`Configuration: ${identified.configuration}`);
+      facts.push(identified.sealed ? "Appears factory sealed / unopened." : "Seal/contents unconfirmed.");
+      if (identified.notable) facts.push(`Notable: ${identified.notable}`);
+    }
+    if (valueEstimate && (valueEstimate.low || valueEstimate.high)) {
+      facts.push(`Seller's rough reference range (do NOT quote as a price): $${valueEstimate.low} - $${valueEstimate.high}.`);
+    }
+    if (userNotes) facts.push(`Seller notes: ${userNotes}`);
+
+    const client = new Anthropic({ apiKey: cleanApiKey() });
+
+    let response;
+    try {
+      response = await client.messages.create({
+        model: "claude-opus-4-8",
+        max_tokens: 2000,
+        thinking: { type: "adaptive" },
+        tools: [{ type: "web_search_20260209", name: "web_search" }],
+        system: [{ type: "text", text: LISTING_SYSTEM, cache_control: { type: "ephemeral" } }],
+        messages: [
+          {
+            role: "user",
+            content:
+              `Write an eBay listing description for the following item. ` +
+              `Research it with web search first, then write the description.\n\n` +
+              facts.join("\n"),
+          },
+        ],
+      });
+    } catch (err) {
+      console.error("generateListing API call failed:", err);
+      throw new HttpsError("internal", "Could not write a description. Try again.");
+    }
+
+    // Concatenate the final text blocks (web search interleaves tool blocks).
+    const description = response.content
+      .filter((b) => b.type === "text")
+      .map((b) => b.text)
+      .join("\n")
+      .trim();
+
+    if (!description) {
+      throw new HttpsError("internal", "Model returned no description.");
+    }
+    return { description };
   },
 );
 
@@ -215,9 +373,6 @@ async function fetchEbaySoldPrices(query, maxResults = 60) {
     }
     const html = await response.text();
 
-    // Match sold-listing prices. eBay's HTML uses s-item__price spans. Some
-    // listings show ranges (e.g. "$5 to $20") — we skip those and keep
-    // single-value prices only for cleaner median.
     const priceMatches = [
       ...html.matchAll(
         /<span class="s-item__price">[^<]*?\$([\d,]+(?:\.\d{2})?)[^<]*?<\/span>/g,
