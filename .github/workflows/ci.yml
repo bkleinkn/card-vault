@@ -1,0 +1,48 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install functions dependencies
+        working-directory: functions
+        # Prefer a clean, reproducible install from the lockfile; fall back to
+        # a plain install if no lockfile is present.
+        run: |
+          if [ -f package-lock.json ]; then
+            npm ci
+          else
+            npm install
+          fi
+
+      - name: Lint functions
+        # The lint config is intentionally lenient (warnings, not errors), so a
+        # clean run exits 0. A hard error (exit code 1) still fails the build;
+        # warnings do not.
+        run: npm run lint --prefix functions
+
+      - name: Test functions
+        run: npm test --prefix functions
+
+      - name: Syntax-check JS sources
+        # node --check validates JS syntax only (it does NOT understand HTML, so
+        # we never point it at index.html).
+        run: |
+          node --check public/app.js
+          node --check public/sw.js
+          node --check functions/index.js

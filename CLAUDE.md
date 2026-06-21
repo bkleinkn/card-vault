@@ -19,7 +19,7 @@ If a feature requires collector jargon to use, it doesn't belong in v1.
 - **Auth:** Firebase Anonymous Auth (frictionless for older users; upgradeable to email later)
 - **Database:** Firestore
 - **Image storage:** Firebase Cloud Storage
-- **AI vision:** Claude Opus 4.7 via the Anthropic SDK (called from a Cloud Function so the key never ships to the client). Adaptive thinking + `output_config.format` json_schema for guaranteed structured output + ephemeral prompt caching on `IDENTIFY_PROMPT` (~90% cost reduction after the first scan).
+- **AI vision:** Claude Opus 4.8 via the Anthropic SDK (called from a Cloud Function so the key never ships to the client). Adaptive thinking + `output_config.format` json_schema for guaranteed structured output + ephemeral prompt caching on `IDENTIFY_PROMPT` (~90% cost reduction after the first scan).
 - **Pricing:** AI rough-estimate first; real eBay sold comps later (see Pricing strategy)
 
 ## MVP scope
@@ -27,7 +27,7 @@ If a feature requires collector jargon to use, it doesn't belong in v1.
 ### IN
 
 1. **Scan** — take a photo of the front of a card (optional back), preview, hit Identify
-2. **AI identify** — Cloud Function calls Claude Opus 4.7 (Anthropic SDK) and returns: sport, year, set/manufacturer, player, card number, team, rookie flag, HOF flag, confidence
+2. **AI identify** — Cloud Function calls Claude Opus 4.8 (Anthropic SDK) and returns: sport, year, set/manufacturer, player, card number, team, rookie flag, HOF flag, confidence
 3. **Rough value estimate** — same vision call asks for a ballpark range labeled clearly as *rough — verify with eBay sold listings*
 4. **Save to collection** — write card + image URL to Firestore
 5. **View collection** — list view with thumbnails, totals, basic search/filter
@@ -70,7 +70,7 @@ TCDB has no public API. For MVP we lean on Claude's training knowledge of mainst
 [PWA: scan view]  --upload-->  [Cloud Storage: /scans/{uid}/{cardId}/front.jpg]
      |
      v
-[Cloud Function: identifyCard]  --calls-->  [Claude Opus 4.7 via Anthropic SDK]
+[Cloud Function: identifyCard]  --calls-->  [Claude Opus 4.8 via Anthropic SDK]
      |                                       returns structured JSON
      |                                       (output_config.format json_schema)
      v
@@ -110,9 +110,12 @@ users/{uid}/cards/{cardId}
     note           // "rough — verify with eBay sold listings"
     estimatedAt
   }
+  ebayPrices?      // real recent eBay sold-comp stats from identifyCard, or null
+                   //   { median, min, max, count, query, searchUrl, fetchedAt }
+                   //   (when no comps found: { query, count: 0, searchUrl })
   userNotes?       // free text
   locationId?      // → users/{uid}/locations/{id}
-  conditionGuess?  // user-entered string for v1; AI-graded later
+  conditionGuess?  // (planned — not yet implemented) user-entered string for v1; AI-graded later
 ```
 
 The collection view groups items as **Manufacturer (set) → Year → Team** via nested `<details>` elements — the primary browse pattern for working through an inherited collection. Sealed packs/boxes have no team, so they bucket under their `itemLabel` at that level. Search / sort / **type (card/pack/box)** / sport / Rookie / HOF / year-range filters narrow what gets bucketed.
@@ -149,7 +152,7 @@ card-vault/
   functions/
     package.json               (@anthropic-ai/sdk)
     package-lock.json
-    index.js                   (identifyCard onCall — Opus 4.7, branches by itemType card/pack/box; generateListing onCall — Opus 4.8 + web_search, AI eBay descriptions)
+    index.js                   (identifyCard onCall — Opus 4.8, branches by itemType card/pack/box; generateListing onCall — Opus 4.8 + web_search, AI eBay descriptions)
   scripts/
     generate-icons.mjs         (npm run icons — SVG→PNG, legacy)
     import-icon.mjs            (npm run icon:import — chroma-key + resize)
@@ -161,7 +164,7 @@ card-vault/
 
 **Phase 1 (scan + identify locally) — DONE + EXPANDED.** Camera capture, mock identify response, full result view. Beyond original scope: generated PWA icons (192/512/maskable), About page with plain-language disclaimers, inline edit-details flow (Player/Year/Set/#/Sport/Rookie/HOF), user notes field, confidence-aware copy (soft "I'm not sure" banner under 50% confidence), and empty-state CTA on collection.
 
-**Phase 2 (real AI) — DONE.** LIVE at **`https://card-vault-d8fa4.web.app`**. Firebase project `card-vault-d8fa4` is parented under the `bkleinkn-org` Google Cloud Organization (note: doesn't show in the default Firebase Console projects list — bookmark the direct URL). Cloud Function `identifyCard` deployed to `us-central1` reading `ANTHROPIC_API_KEY` from Firebase Secrets Manager. Client `USE_MOCK_AI = false` flag flipped — real scans hit Claude Opus 4.7. Build IAM roles (`cloudbuild.builds.builder`, `artifactregistry.writer`, `logging.logWriter`) granted to the default Compute Engine service account once; future deploys work without re-granting.
+**Phase 2 (real AI) — DONE.** LIVE at **`https://card-vault-d8fa4.web.app`**. Firebase project `card-vault-d8fa4` is parented under the `bkleinkn-org` Google Cloud Organization (note: doesn't show in the default Firebase Console projects list — bookmark the direct URL). Cloud Function `identifyCard` deployed to `us-central1` reading `ANTHROPIC_API_KEY` from Firebase Secrets Manager. Client `USE_MOCK_AI = false` flag flipped — real scans hit Claude Opus 4.8. Build IAM roles (`cloudbuild.builds.builder`, `artifactregistry.writer`, `logging.logWriter`) granted to the default Compute Engine service account once; future deploys work without re-granting.
 
 **Phase 3 (collection) — DONE.** Firestore CRUD, list view, detail view with edit flow, delete, search — all live and exercised via the deployed app.
 
@@ -176,7 +179,7 @@ card-vault/
 - **Live URL:** [https://card-vault-d8fa4.web.app](https://card-vault-d8fa4.web.app)
 - **Firebase Console (direct link — bookmark; the org-parented project doesn't show in the default project list):** [console.firebase.google.com/project/card-vault-d8fa4/overview](https://console.firebase.google.com/project/card-vault-d8fa4/overview)
 - **GitHub:** [github.com/bkleinkn/card-vault](https://github.com/bkleinkn/card-vault)
-- **Per-scan cost:** ~$0.01–0.03 (Claude Opus 4.7 with prompt-caching kicking in after the first scan).
+- **Per-scan cost:** ~$0.01–0.03 (Claude Opus 4.8 with prompt-caching kicking in after the first scan). `generateListing` (AI eBay descriptions) also uses Opus 4.8 with web search.
 - **Secret rotation:** if `ANTHROPIC_API_KEY` ever needs swapping, run `firebase functions:secrets:set ANTHROPIC_API_KEY --project=card-vault-d8fa4` then `firebase deploy --only functions --project=card-vault-d8fa4`.
 - **USE_MOCK_AI escape hatch:** Flip `const USE_MOCK_AI = true;` in `public/app.js` to temporarily revert all scans to the mocked 1956 Mantle without redeploying the function (useful for cost-free UX iteration). Then `firebase deploy --only hosting`.
 - **Cross-PC dev:** `git clone https://github.com/bkleinkn/card-vault.git && cd card-vault && npm install && cd functions && npm install`. Firebase deploys from any machine work after `firebase login` (as bkleinkn@gmail.com) — secrets stay server-side.
