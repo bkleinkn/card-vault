@@ -1,10 +1,18 @@
 rules_version = '2';
 
 // Card scans live under /scans/{uid}/... — owner-only.
+// Uploads must be images and size-bounded; owner reads/deletes unrestricted
+// (delete has no request.resource, so it isn't gated by size/contentType).
 service firebase.storage {
   match /b/{bucket}/o {
     match /scans/{userId}/{allPaths=**} {
-      allow read, write: if request.auth != null && request.auth.uid == userId;
+      function owner() {
+        return request.auth != null && request.auth.uid == userId;
+      }
+      allow read, delete: if owner();
+      allow create, update: if owner()
+        && request.resource.size < 15 * 1024 * 1024
+        && request.resource.contentType.matches('image/.*');
     }
   }
 }

@@ -1,10 +1,49 @@
 rules_version = '2';
 
 // Each user can only read/write their own subtree.
+// Explicit, owner-scoped matches with light, non-breaking validation on
+// PRESENT fields only (never require optional fields, never use hasOnly).
 service cloud.firestore {
   match /databases/{database}/documents {
-    match /users/{userId}/{document=**} {
-      allow read, write: if request.auth != null && request.auth.uid == userId;
+
+    function owner(userId) {
+      return request.auth != null && request.auth.uid == userId;
+    }
+
+    // User profile doc.
+    match /users/{userId} {
+      allow read, write: if owner(userId);
+    }
+
+    // Cards: created/updated/deleted by the owner.
+    match /users/{userId}/cards/{cardId} {
+      allow read, delete: if owner(userId);
+      allow create, update: if owner(userId)
+        && ( !('userNotes' in request.resource.data)
+             || request.resource.data.userNotes == null
+             || (request.resource.data.userNotes is string
+                 && request.resource.data.userNotes.size() <= 5000) )
+        && ( !('itemType' in request.resource.data)
+             || request.resource.data.itemType is string )
+        && ( !('identified' in request.resource.data)
+             || request.resource.data.identified is map )
+        && ( !('valueEstimate' in request.resource.data)
+             || request.resource.data.valueEstimate == null
+             || request.resource.data.valueEstimate is map );
+    }
+
+    // Storage locations.
+    match /users/{userId}/locations/{locId} {
+      allow read, delete: if owner(userId);
+      allow create, update: if owner(userId)
+        && ( !('name' in request.resource.data)
+             || request.resource.data.name is string );
+    }
+
+    // Usage counters (written by the Cloud Function via Admin SDK, which
+    // bypasses rules; kept owner-scoped for direct client access).
+    match /users/{userId}/usage/{usageId} {
+      allow read, write: if owner(userId);
     }
   }
 }
