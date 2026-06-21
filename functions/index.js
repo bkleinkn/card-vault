@@ -195,18 +195,28 @@ function getAnthropic() {
 async function enforceDailyQuota(uid, kind, limit) {
   const day = new Date().toISOString().slice(0, 10); // YYYY-MM-DD (UTC)
   const ref = admin.firestore().doc(`users/${uid}/usage/${day}`);
-  await admin.firestore().runTransaction(async (tx) => {
-    const snap = await tx.get(ref);
-    const current = (snap.exists && snap.data() && Number(snap.data()[kind])) || 0;
-    if (current >= limit) {
-      throw new HttpsError("resource-exhausted", "Daily limit reached. Try again tomorrow.");
-    }
-    tx.set(
-      ref,
-      { [kind]: admin.firestore.FieldValue.increment(1), updatedAt: new Date().toISOString() },
-      { merge: true },
-    );
-  });
+  try {
+    await admin.firestore().runTransaction(async (tx) => {
+      const snap = await tx.get(ref);
+      const current = (snap.exists && snap.data() && Number(snap.data()[kind])) || 0;
+      if (current >= limit) {
+        throw new HttpsError("resource-exhausted", "Daily limit reached. Try again tomorrow.");
+      }
+      tx.set(
+        ref,
+        { [kind]: admin.firestore.FieldValue.increment(1), updatedAt: new Date().toISOString() },
+        { merge: true },
+      );
+    });
+  } catch (err) {
+    // A genuine over-limit must block.
+    if (err instanceof HttpsError && err.code === "resource-exhausted") throw err;
+    // Any OTHER failure (most importantly: the runtime service account lacking
+    // Firestore access — code 7 PERMISSION_DENIED — on this org-parented project)
+    // must FAIL OPEN so the core scan/listing still works. The quota starts
+    // enforcing automatically once roles/datastore.user is granted to the SA.
+    console.warn(`enforceDailyQuota fail-open (${kind}) for ${uid}:`, err && err.message);
+  }
 }
 
 // NOTE: For stronger abuse protection, App Check is the recommended next step
@@ -507,6 +517,125 @@ async function fetchEbaySoldPrices(query, maxResults = 60) {
     clearTimeout(timer);
   }
 }
+
+// --- Public view-only share links ------------------------------------------
+// A user can mint an unguessable token that maps to their uid via a top-level
+// shares/{token} doc (Admin-only; clients can't read or write it — see rules).
+// getSharedCollection is PUBLIC and returns a privacy-stripped, kept-only view
+// of the owner's collection. createShareLink/revokeShareLink manage the token.
+
+const SHARE_MAX_CARDS = 2000;
+
+// Mint (or rotate) a view-only share link for the signed-in user. Any existing
+// token is invalidated first so old links stop working. Returns { token }.
+exports.createShareLink = onCall(
+  { cors: true, region: "us-central1" },
+  async (request) => {
+    if (!request.auth) {
+      throw new HttpsError("unauthenticated", "Sign in required.");
+    }
+    const uid = request.auth.uid;
+    try {
+      const db = admin.firestore();
+      const userRef = db.doc(`users/${uid}`);
+      const userSnap = await userRef.get();
+      const oldToken = userSnap.exists ? userSnap.data().shareToken : null;
+      if (oldToken) {
+        // Kill the old mapping so previously-shared links die.
+        await db.doc(`shares/${oldToken}`).delete();
+      }
+
+      const token = require("crypto").randomUUID();
+      await db.doc(`shares/${token}`).set({
+        uid,
+        createdAt: admin.firestore.FieldValue.serverTimestamp(),
+      });
+      await userRef.set({ shareToken: token }, { merge: true });
+
+      return { token };
+    } catch (err) {
+      console.error(`createShareLink failed for ${uid}:`, err);
+      throw new HttpsError("internal", "Could not create a share link. Try again.");
+    }
+  },
+);
+
+// Revoke the signed-in user's current share link (if any). Returns { ok: true }.
+exports.revokeShareLink = onCall(
+  { cors: true, region: "us-central1" },
+  async (request) => {
+    if (!request.auth) {
+      throw new HttpsError("unauthenticated", "Sign in required.");
+    }
+    const uid = request.auth.uid;
+    try {
+      const db = admin.firestore();
+      const userRef = db.doc(`users/${uid}`);
+      const userSnap = await userRef.get();
+      const token = userSnap.exists ? userSnap.data().shareToken : null;
+      if (token) {
+        await db.doc(`shares/${token}`).delete();
+      }
+      await userRef.set({ shareToken: null }, { merge: true });
+
+      return { ok: true };
+    } catch (err) {
+      console.error(`revokeShareLink failed for ${uid}:`, err);
+      throw new HttpsError("internal", "Could not revoke the share link. Try again.");
+    }
+  },
+);
+
+// PUBLIC: resolve a share token to a privacy-stripped, kept-only view of the
+// owner's collection. No auth required. Returns { cards: [...], count }.
+exports.getSharedCollection = onCall(
+  { cors: true, region: "us-central1" },
+  async (request) => {
+    const token = request.data && request.data.token;
+    if (typeof token !== "string" || token.trim() === "") {
+      throw new HttpsError("invalid-argument", "A share token is required.");
+    }
+    try {
+      const db = admin.firestore();
+      const shareSnap = await db.doc(`shares/${token}`).get();
+      if (!shareSnap.exists) {
+        throw new HttpsError("not-found", "This share link is no longer active.");
+      }
+      const uid = shareSnap.data().uid;
+
+      const cardsSnap = await db.collection(`users/${uid}/cards`).get();
+
+      const cards = cardsSnap.docs
+        .map((d) => ({ id: d.id, ...d.data() }))
+        // Kept-only: drop anything explicitly marked "pending". Missing/other
+        // status counts as kept.
+        .filter((c) => c.status !== "pending")
+        // Newest first when createdAt is present.
+        .sort((a, b) => {
+          const ta = a.createdAt && a.createdAt.toMillis ? a.createdAt.toMillis() : 0;
+          const tb = b.createdAt && b.createdAt.toMillis ? b.createdAt.toMillis() : 0;
+          return tb - ta;
+        })
+        .slice(0, SHARE_MAX_CARDS)
+        // Privacy: expose only display fields. No values, notes, locations, or
+        // timestamps reach the public view.
+        .map((c) => ({
+          id: c.id,
+          itemType: c.itemType === "pack" || c.itemType === "box" ? c.itemType : "card",
+          identified: c.identified,
+          imageFrontUrl: c.imageFrontUrl,
+          imageBackUrl: c.imageBackUrl,
+        }));
+
+      return { cards, count: cards.length };
+    } catch (err) {
+      // Re-throw clean HttpsErrors (e.g. not-found) as-is; wrap everything else.
+      if (err instanceof HttpsError) throw err;
+      console.error(`getSharedCollection failed for token "${token}":`, err);
+      throw new HttpsError("internal", "Could not load the shared collection.");
+    }
+  },
+);
 
 // --- Storage cleanup on card delete ----------------------------------------
 // When a card doc is deleted, remove its uploaded Storage objects so images
