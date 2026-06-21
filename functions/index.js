@@ -244,86 +244,167 @@ exports.identifyCard = onCall(
     }
 
     const type = itemType === "pack" || itemType === "box" ? itemType : "card";
-    const { prompt, schema, label } = promptAndSchema(type);
+    return await identifyImages(frontImageBase64, backImageBase64, type);
+  },
+);
 
-    const client = getAnthropic();
+// Core model call + response parsing + eBay-price enrichment, shared by both
+// identifyCard (base64 from the client) and identifyStored (base64 read back
+// out of Cloud Storage). `type` must already be normalized to card/pack/box.
+// Returns the `parsed` object with parsed.itemType set, valueEstimate.estimatedAt
+// stamped, and ebayPrices attached when a usable query could be built.
+async function identifyImages(frontImageBase64, backImageBase64, type) {
+  const { prompt, schema, label } = promptAndSchema(type);
 
-    const userContent = [
-      { type: "text", text: `Identify this ${label}. Respond with JSON only.` },
-      { type: "image", source: { type: "base64", media_type: "image/jpeg", data: frontImageBase64 } },
-    ];
-    if (backImageBase64) {
-      userContent.push({
-        type: "image",
-        source: { type: "base64", media_type: "image/jpeg", data: backImageBase64 },
-      });
+  const client = getAnthropic();
+
+  const userContent = [
+    { type: "text", text: `Identify this ${label}. Respond with JSON only.` },
+    { type: "image", source: { type: "base64", media_type: "image/jpeg", data: frontImageBase64 } },
+  ];
+  if (backImageBase64) {
+    userContent.push({
+      type: "image",
+      source: { type: "base64", media_type: "image/jpeg", data: backImageBase64 },
+    });
+  }
+
+  let response;
+  try {
+    response = await client.messages.create({
+      // claude-opus-4-8 is the recommended default and is documented to
+      // support structured outputs (output_config.format json_schema);
+      // claude-opus-4-7 is not in that support list.
+      model: "claude-opus-4-8",
+      // Adaptive thinking spends tokens from this same budget BEFORE the JSON
+      // is emitted, so the ceiling must cover thinking + the (small) output.
+      // 1500 was too low — thinking could exhaust it and the response would
+      // come back truncated (stop_reason "max_tokens") with no parseable JSON.
+      max_tokens: 8000,
+      thinking: { type: "adaptive" },
+      output_config: { format: { type: "json_schema", schema } },
+      // Frozen per-type prompt, cached across scans (~90% cost cut on the
+      // cached portion). Each item type keys its own cache entry.
+      system: [{ type: "text", text: prompt, cache_control: { type: "ephemeral" } }],
+      messages: [{ role: "user", content: userContent }],
+    });
+  } catch (err) {
+    console.error("Anthropic API call failed:", err);
+    throw new HttpsError("internal", `Could not identify ${label}. Try again.`);
+  }
+
+  // Note a non-"end_turn" stop_reason (e.g. "max_tokens"/"refusal") for
+  // diagnostics, but DON'T fail on it alone — if a complete JSON text block is
+  // present we should still use it. The parse step below is the real gate.
+  if (response.stop_reason && response.stop_reason !== "end_turn") {
+    console.warn(`stop_reason "${response.stop_reason}" for ${label} — parsing anyway.`);
+  }
+
+  const textBlock = response.content.find((b) => b.type === "text");
+  if (!textBlock) {
+    console.error("No text block in response:", JSON.stringify(response));
+    throw new HttpsError("internal", "Model returned no content.");
+  }
+
+  let parsed;
+  try {
+    parsed = JSON.parse(textBlock.text);
+  } catch {
+    console.error("Failed to parse JSON:", textBlock.text);
+    throw new HttpsError("internal", "Model returned invalid JSON.");
+  }
+
+  parsed.itemType = type;
+  if (parsed.valueEstimate) {
+    parsed.valueEstimate.estimatedAt = new Date().toISOString();
+  }
+
+  // Real recent eBay sold prices as a second source. Query differs by type.
+  const ident = parsed.identified || {};
+  let queryParts;
+  if (type === "card") {
+    queryParts = ident.player && ident.player !== "Unknown card"
+      ? [ident.year, ident.set, ident.player, ident.cardNumber]
+      : null;
+  } else {
+    const known = ident.itemLabel && !/^unknown/i.test(ident.itemLabel);
+    queryParts = known ? [ident.year, ident.set, ident.itemLabel, "sealed"] : null;
+  }
+  if (queryParts) {
+    parsed.ebayPrices = await fetchEbaySoldPrices(queryParts.filter(Boolean).join(" "));
+  }
+
+  return parsed;
+}
+
+// Re-run identification on a card already saved to Firestore (the "needs
+// identify" path: it was persisted even though the original scan failed or was
+// never identified). Reads the stored image(s) back out of Cloud Storage,
+// identifies, and writes the result onto the existing card doc.
+//
+// IAM: the runtime service account needs Firestore + Storage READ access — the
+// same grant the share functions / onCardDeleted already require on this
+// org-parented project (roles/datastore.user + roles/storage.objectViewer).
+exports.identifyStored = onCall(
+  { secrets: [ANTHROPIC_API_KEY], cors: true, region: "us-central1", timeoutSeconds: 120 },
+  async (request) => {
+    if (!request.auth) {
+      throw new HttpsError("unauthenticated", "Sign in required.");
+    }
+    const uid = request.auth.uid;
+    const cardId = request.data && request.data.cardId;
+    if (typeof cardId !== "string" || cardId.trim() === "") {
+      throw new HttpsError("invalid-argument", "A cardId is required.");
     }
 
-    let response;
+    await enforceDailyQuota(uid, "identify", 400);
+
     try {
-      response = await client.messages.create({
-        // claude-opus-4-8 is the recommended default and is documented to
-        // support structured outputs (output_config.format json_schema);
-        // claude-opus-4-7 is not in that support list.
-        model: "claude-opus-4-8",
-        // The JSON output is tiny; 1500 is ample. Adaptive thinking is kept.
-        max_tokens: 1500,
-        thinking: { type: "adaptive" },
-        output_config: { format: { type: "json_schema", schema } },
-        // Frozen per-type prompt, cached across scans (~90% cost cut on the
-        // cached portion). Each item type keys its own cache entry.
-        system: [{ type: "text", text: prompt, cache_control: { type: "ephemeral" } }],
-        messages: [{ role: "user", content: userContent }],
-      });
+      const db = admin.firestore();
+      const ref = db.doc(`users/${uid}/cards/${cardId}`);
+      const snap = await ref.get();
+      if (!snap.exists) {
+        throw new HttpsError("not-found", "That card no longer exists.");
+      }
+      const card = snap.data() || {};
+      const type = card.itemType === "pack" || card.itemType === "box" ? card.itemType : "card";
+
+      const bucket = admin.storage().bucket();
+      let frontB64;
+      try {
+        const [frontBuf] = await bucket.file(`scans/${uid}/${cardId}/front.jpg`).download();
+        frontB64 = frontBuf.toString("base64");
+      } catch (err) {
+        console.error(`identifyStored: front image download failed for ${uid}/${cardId}:`, err);
+        throw new HttpsError("not-found", "Couldn't load the saved image.");
+      }
+      let backB64 = null;
+      try {
+        const [b] = await bucket.file(`scans/${uid}/${cardId}/back.jpg`).download();
+        backB64 = b.toString("base64");
+      } catch {
+        // No back image is fine.
+      }
+
+      const parsed = await identifyImages(frontB64, backB64, type);
+
+      await ref.set(
+        {
+          identified: parsed.identified,
+          valueEstimate: parsed.valueEstimate || null,
+          ebayPrices: parsed.ebayPrices || null,
+          needsIdentify: false,
+        },
+        { merge: true },
+      );
+
+      return parsed;
     } catch (err) {
-      console.error("Anthropic API call failed:", err);
-      throw new HttpsError("internal", `Could not identify ${label}. Try again.`);
+      // Re-throw clean HttpsErrors (not-found / model errors) as-is; wrap the rest.
+      if (err instanceof HttpsError) throw err;
+      console.error(`identifyStored failed for ${uid}/${cardId}:`, err);
+      throw new HttpsError("internal", "Could not identify that card. Try again.");
     }
-
-    // Guard against truncated/refused/paused responses before trying to parse.
-    // A non-"end_turn" stop_reason (e.g. "max_tokens", "refusal", "pause_turn")
-    // means the text block is likely incomplete and JSON.parse would throw on
-    // garbage — surface a clean retryable error instead.
-    if (response.stop_reason && response.stop_reason !== "end_turn") {
-      console.error(`Unexpected stop_reason "${response.stop_reason}" for ${label}.`);
-      throw new HttpsError("internal", "Could not identify card. Try again.");
-    }
-
-    const textBlock = response.content.find((b) => b.type === "text");
-    if (!textBlock) {
-      console.error("No text block in response:", JSON.stringify(response));
-      throw new HttpsError("internal", "Model returned no content.");
-    }
-
-    let parsed;
-    try {
-      parsed = JSON.parse(textBlock.text);
-    } catch {
-      console.error("Failed to parse JSON:", textBlock.text);
-      throw new HttpsError("internal", "Model returned invalid JSON.");
-    }
-
-    parsed.itemType = type;
-    if (parsed.valueEstimate) {
-      parsed.valueEstimate.estimatedAt = new Date().toISOString();
-    }
-
-    // Real recent eBay sold prices as a second source. Query differs by type.
-    const ident = parsed.identified || {};
-    let queryParts;
-    if (type === "card") {
-      queryParts = ident.player && ident.player !== "Unknown card"
-        ? [ident.year, ident.set, ident.player, ident.cardNumber]
-        : null;
-    } else {
-      const known = ident.itemLabel && !/^unknown/i.test(ident.itemLabel);
-      queryParts = known ? [ident.year, ident.set, ident.itemLabel, "sealed"] : null;
-    }
-    if (queryParts) {
-      parsed.ebayPrices = await fetchEbaySoldPrices(queryParts.filter(Boolean).join(" "));
-    }
-
-    return parsed;
   },
 );
 
