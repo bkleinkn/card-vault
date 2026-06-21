@@ -80,15 +80,19 @@ TCDB has no public API. For MVP we lean on Claude's training knowledge of mainst
 [PWA: collection view]  <--read--  Firestore
 ```
 
+Scans land as `status:"pending"` and surface in the **Needs review** view (`#/review`, `#/review/{cardId}`) before being kept into the collection. A public, read-only **share** view (`#/share/{token}`) renders the owner's kept cards via the no-auth `getSharedCollection` function.
+
 ## Data model (Firestore)
 
 ```
 users/{uid}
   createdAt
   displayName? (optional)
+  shareToken?      // current public view-only share token (→ shares/{token}); null/absent ⇒ no active link
 
 users/{uid}/cards/{cardId}
   createdAt
+  status           // "pending" (just scanned, needs review) | "kept" (in collection)  (missing ⇒ treat as "kept")
   itemType         // "card" | "pack" | "box"  (missing ⇒ treat as "card")
   imageFrontUrl
   imageBackUrl?
@@ -116,9 +120,19 @@ users/{uid}/cards/{cardId}
   userNotes?       // free text
   locationId?      // → users/{uid}/locations/{id}
   conditionGuess?  // (planned — not yet implemented) user-entered string for v1; AI-graded later
+
+shares/{token}     // top-level; unguessable token → owner. Client-denied in rules (Admin-only via Cloud Functions)
+  uid              // owner whose kept cards this token exposes
+  createdAt
 ```
 
-The collection view groups items as **Manufacturer (set) → Year → Team** via nested `<details>` elements — the primary browse pattern for working through an inherited collection. Sealed packs/boxes have no team, so they bucket under their `itemLabel` at that level. Search / sort / **type (card/pack/box)** / sport / Rookie / HOF / year-range filters narrow what gets bucketed.
+The collection view shows only **kept** cards (`status:"kept"` or missing); pending scans live in the "Needs review" view (`#/review`). It groups items as **Manufacturer (set) → Year → Team** via nested `<details>` elements — the primary browse pattern for working through an inherited collection. Sealed packs/boxes have no team, so they bucket under their `itemLabel` at that level. Search / sort / **type (card/pack/box)** / sport / Rookie / HOF / year-range filters narrow what gets bucketed.
+
+**Durable pending-review pool.** A scan is uploaded + written to Firestore as `status:"pending"` immediately after identification (not held in memory until Save), so leaving the app — tapping an external eBay link, reloading, switching devices — no longer loses scanned cards. The "Needs review" view at `#/review` (and `#/review/{cardId}`) lists pending cards; reviewing one is either **Keep** (`status`→`"kept"`, with edits/notes/location) or **Discard** (deletes the doc; the `onCardDeleted` trigger cleans up its Storage images).
+
+**Bulk location.** In Bulk mode the scan view shows a location picker (with inline "+ New"); the chosen location is auto-applied as `locationId` to every card scanned in that batch, so a whole box gets one location automatically.
+
+**Public view-only share link.** From the Collection view ("Share") the owner can create / copy / revoke an unguessable link backed by `shares/{token}`. Anyone with the link opens `#/share/{token}` to see a read-only gallery of the owner's **kept** cards. `getSharedCollection` strips `valueEstimate`, `ebayPrices`, `userNotes`, and `locationId` — so the public view shows cards and details but **no** dollar values, notes, or locations. The recipient view hides the app's nav chrome (`body.viewing-share`).
 
 **Three item types.** The scan view has a Card / Pack / Box selector; the chosen type tags every capture and is passed to `identifyCard`, which switches to a type-specific prompt + JSON schema. Result/detail/collection/CSV/edit-form/eBay-listing all branch on `itemType` via shared helpers (`itemTypeOf`, `displayName`, `identifiedSummaryHTML`, `renderEditFormHTML`).
 
@@ -152,7 +166,7 @@ card-vault/
   functions/
     package.json               (@anthropic-ai/sdk)
     package-lock.json
-    index.js                   (identifyCard onCall — Opus 4.8, branches by itemType card/pack/box; generateListing onCall — Opus 4.8 + web_search, AI eBay descriptions)
+    index.js                   (identifyCard onCall — Opus 4.8, branches by itemType card/pack/box; generateListing onCall — Opus 4.8 + web_search, AI eBay descriptions; createShareLink / revokeShareLink onCall — auth'd, manage shares/{token} + users/{uid}.shareToken; getSharedCollection onCall — PUBLIC/no-auth, returns owner's kept cards with values/notes/location stripped; onCardDeleted trigger — cleans up Storage images)
   scripts/
     generate-icons.mjs         (npm run icons — SVG→PNG, legacy)
     import-icon.mjs            (npm run icon:import — chroma-key + resize)
@@ -172,7 +186,9 @@ card-vault/
 
 **Phase 5 (item types + AI listings + background scanning) — CODE DONE, NEEDS DEPLOY.** Background scan queue with a review tray + Bulk mode (capture many, identify in background, review before save). Card / Pack / Box item types end-to-end. AI-written eBay descriptions via `generateListing`. Inline location creation on the detail page. Verified locally with `USE_MOCK_AI`. **To go live:** `firebase deploy --only functions --project=card-vault-d8fa4` (picks up `generateListing` + the pack/box prompts) **and** `firebase deploy --only hosting --project=card-vault-d8fa4` (client). The AI description and pack/box identify won't work until functions are deployed.
 
-**Phase 6+ (deferred features)** — real pricing data, condition grading, selling assistance, custom domain, etc.
+**Phase 6 (durable review pool + sharing) — CODE DONE, NEEDS DEPLOY.** Durable pending-review pool: scans persist to Firestore as `status:"pending"` the moment they're identified, so nothing is lost on reload / external link / device switch; the "Needs review" view (`#/review`) handles Keep vs Discard and the collection shows only kept cards. Bulk mode auto-applies a batch location to every card. Public view-only share link: `createShareLink` / `revokeShareLink` (auth'd) + `getSharedCollection` (PUBLIC) back a `shares/{token}` → uid map (Admin-only in rules), surfaced as a `#/share/{token}` read-only gallery with dollar values, notes, and locations stripped. **To go live:** `firebase deploy --only functions --project=card-vault-d8fa4` (createShareLink / revokeShareLink / getSharedCollection + onCardDeleted), `firebase deploy --only firestore:rules --project=card-vault-d8fa4` (shares collection lockdown), **and** `firebase deploy --only hosting --project=card-vault-d8fa4`.
+
+**Phase 7+ (deferred features)** — real pricing data, condition grading, selling assistance, custom domain, etc.
 
 ## Operational notes
 
