@@ -20,6 +20,7 @@ import {
   deleteDoc,
   updateDoc,
   query,
+  where,
   orderBy,
   serverTimestamp,
 } from "https://www.gstatic.com/firebasejs/10.13.2/firebase-firestore.js";
@@ -67,6 +68,8 @@ if (FIREBASE_READY) {
     // Re-render whatever view is active (detail, locations, collection) now that
     // currentUser is known — fixes the detail view dead-ending on "Signing in…".
     route();
+    // Populate the review-pool count / badges / banners now that we can query.
+    refreshPendingCount();
   });
 
   signInAnonymously(auth).catch((err) => {
@@ -101,6 +104,15 @@ const state = {
   editingResult: false,
   reviewJobId: null,    // when set, the result view is reviewing a queued scan
   itemType: "card",     // what the scanner is currently set to: card | pack | box
+  bulkLocationId: null, // bulk mode: location auto-applied to every pending card
+};
+
+// Review-screen state: which pending card is being reviewed, its loaded data,
+// and whether the inline edit form is open. Mirrors detailState.
+const reviewState = {
+  cardId: null,
+  card: null,
+  editing: false,
 };
 
 const detailState = {
@@ -314,7 +326,17 @@ function route() {
   const isScan = hash === "#" || hash === "" || hash.startsWith("#/scan");
   if (!isScan) stopScanCamera();
 
-  if (hash.startsWith("#/scan")) {
+  // Public share route: strip the owner's app chrome so a recipient only sees
+  // the read-only gallery (handled via body.viewing-share in app.css).
+  document.body.classList.toggle("viewing-share", hash.startsWith("#/share/"));
+
+  if (hash.startsWith("#/share/")) {
+    // Everything after "#/share/" is the token (it may legitimately contain no
+    // slashes, but slice rather than split so an odd token isn't truncated).
+    const token = hash.slice("#/share/".length);
+    showView("share");
+    renderSharedView(token);
+  } else if (hash.startsWith("#/scan")) {
     showView("scan");
     showCameraStart();
   } else if (hash.startsWith("#/collection")) {
@@ -334,6 +356,13 @@ function route() {
       location.hash = "#/scan";
       return;
     }
+  } else if (hash.startsWith("#/review/")) {
+    const id = hash.split("/")[2];
+    showView("review");
+    renderReviewCard(id);
+  } else if (hash.startsWith("#/review")) {
+    showView("review");
+    renderReview();
   } else if (hash.startsWith("#/locations")) {
     showView("locations");
     renderLocations();
@@ -498,6 +527,8 @@ function showCameraStart() {
   hideSingleProcessing();
   renderTray();
   updateNavBadge();
+  syncBulkLocationVisibility();
+  refreshPendingCount();
   if (!camSupported()) {
     enableCameraBtn.hidden = true;
     showCameraFallback("This browser can't open the camera here. Upload a photo instead.");
@@ -648,6 +679,30 @@ const QUEUE = {
   MAX: 3,              // cap concurrent identify calls (cost + load)
 };
 
+// How many pending (un-reviewed) cards exist in Firestore. Kept in a module
+// variable so the nav badge and "Needs review" banners can render synchronously;
+// refreshPendingCount() updates it from Firestore and re-paints those surfaces.
+let pendingCount = 0;
+
+async function refreshPendingCount() {
+  if (!FIREBASE_READY || !currentUser) {
+    pendingCount = 0;
+    updateNavBadge();
+    updateReviewSurfaces();
+    return;
+  }
+  try {
+    const snap = await getDocs(
+      query(collection(db, "users", currentUser.uid, "cards"), where("status", "==", "pending")),
+    );
+    pendingCount = snap.size;
+  } catch (err) {
+    console.warn("Couldn't count pending cards", err);
+  }
+  updateNavBadge();
+  updateReviewSurfaces();
+}
+
 function enqueueScan(frontFile, backFile = null) {
   const job = {
     id: crypto.randomUUID(),
@@ -679,28 +734,98 @@ async function runJob(job) {
   job.status = "identifying";
   QUEUE.active++;
   renderTray();
+  // Tracks how this job ended so the finally block can route correctly:
+  // "persisted" (saved as pending Firestore card), "ready" (in-memory demo
+  // fallback), or "error".
+  let outcome = null;
+  let persistedCardId = null;
+  let wasBulk = false;
+  // Capture single-mode "waiting" intent up front: removeJob() (below) clears
+  // QUEUE.waitingJobId, so we can't read it in the finally block to decide
+  // whether to auto-open the review screen.
+  let wasWaiting = QUEUE.waitingJobId === job.id;
   try {
     const result = await identifyCard(job.frontFile, job.backFile, job.itemType);
     if (!QUEUE.jobs.includes(job)) return; // discarded mid-flight
     job.result = result;
-    job.status = "ready";
+
+    // Durability: the moment we have an identify result, write it to Firestore
+    // as a PENDING card (images uploaded first) so nothing is lost if the page
+    // is discarded during review. Only when signed in — demo / pre-auth keeps
+    // the in-memory "ready" + result-view Save fallback.
+    if (FIREBASE_READY && currentUser) {
+      wasBulk = isBulkMode();
+      // Re-read in case the user tapped "Scan next" while identify was running.
+      wasWaiting = QUEUE.waitingJobId === job.id;
+      try {
+        const cardId = await persistPendingCard(job);
+        if (!QUEUE.jobs.includes(job)) return; // discarded mid-upload
+        persistedCardId = cardId;
+        outcome = "persisted";
+        // It now lives in Firestore; drop it from the in-memory queue.
+        removeJob(job.id);
+      } catch (perr) {
+        console.error("Persisting scan failed", perr);
+        if (!QUEUE.jobs.includes(job)) return;
+        // Keep the File in memory and let the user retry — never lose the scan.
+        job.status = "error";
+        job.error = perr;
+        outcome = "error";
+      }
+    } else {
+      job.status = "ready";
+      outcome = "ready";
+    }
   } catch (err) {
     console.error("Background identify failed", err);
     if (!QUEUE.jobs.includes(job)) return;
     job.status = "error";
     job.error = err;
+    outcome = "error";
   } finally {
     QUEUE.active = Math.max(0, QUEUE.active - 1);
     renderTray();
     updateNavBadge();
-    // Single-mode "wait here": auto-open the result the moment it's ready.
-    if (QUEUE.waitingJobId === job.id && QUEUE.jobs.includes(job)) {
+
+    if (outcome === "persisted") {
+      // Single-mode: take the user straight to the review screen for this card.
+      // Bulk-mode: stay on the camera so they keep scanning; it waits in the pool.
+      // (removeJob already cleared QUEUE.waitingJobId; wasWaiting was captured.)
+      if (!wasBulk && wasWaiting) {
+        hideSingleProcessing();
+        location.hash = `#/review/${persistedCardId}`;
+      }
+    } else if (QUEUE.waitingJobId === job.id && QUEUE.jobs.includes(job)) {
+      // Demo / in-memory fallback path: auto-open the result when ready.
       QUEUE.waitingJobId = null;
       if (job.status === "ready") reviewJob(job.id);
       else if (job.status === "error") showSingleError(job);
     }
     pumpQueue();
   }
+}
+
+// Upload a job's images and write a PENDING card doc. Returns the new cardId.
+// Used by the background queue's success path so every identified scan is
+// durable immediately (survives a page discard during review).
+async function persistPendingCard(job) {
+  const cardId = crypto.randomUUID();
+  const frontUrl = await uploadImage(job.frontFile, cardId, "front");
+  const backUrl = job.backFile ? await uploadImage(job.backFile, cardId, "back") : null;
+  const result = job.result || {};
+  await setDoc(doc(db, "users", currentUser.uid, "cards", cardId), {
+    createdAt: serverTimestamp(),
+    status: "pending",
+    itemType: job.itemType || "card",
+    imageFrontUrl: frontUrl,
+    imageBackUrl: backUrl,
+    identified: result.identified || {},
+    valueEstimate: result.valueEstimate || null,
+    ebayPrices: result.ebayPrices || null,
+    locationId: state.bulkLocationId || null,
+    userNotes: null,
+  });
+  return cardId;
 }
 
 function retryJob(id) {
@@ -931,12 +1056,18 @@ function syncResultButtons() {
   }
 }
 
-// Badge on the Scan nav tab showing how many cards are waiting in the queue.
+// Badge on the Scan nav tab: in-flight queue jobs still identifying/errored.
+// (Pending cards now live in Firestore and get their own Review-tab badge.)
 function updateNavBadge() {
-  const link = document.querySelector('.navlink[data-nav="scan"]');
+  setNavBadge("scan", QUEUE.jobs.length);
+  setNavBadge("review", pendingCount);
+}
+
+// Set/clear a count badge on a given bottom-nav link.
+function setNavBadge(nav, n) {
+  const link = document.querySelector(`.navlink[data-nav="${nav}"]`);
   if (!link) return;
   let badge = link.querySelector(".nav-badge");
-  const n = QUEUE.jobs.length;
   if (!n) {
     if (badge) badge.remove();
     return;
@@ -949,12 +1080,100 @@ function updateNavBadge() {
   badge.textContent = String(n);
 }
 
+// Show/update the "Needs review (N)" banners on the Scan and Collection views.
+// Hidden when there's nothing pending. Built into containers added in index.html.
+function updateReviewSurfaces() {
+  document.querySelectorAll(".review-cta").forEach((el) => {
+    if (pendingCount > 0) {
+      el.hidden = false;
+      el.innerHTML = `<a href="#/review" class="review-cta-link">Needs review (${pendingCount}) &rarr;</a>`;
+    } else {
+      el.hidden = true;
+      el.innerHTML = "";
+    }
+  });
+}
+
 if (bulkToggleEl) {
   bulkToggleEl.addEventListener("change", () => {
+    syncBulkLocationVisibility();
     if (isBulkMode()) {
       hideSingleProcessing();
       if (camSupported() && !cameraStream) startScanCamera();
       else if (cameraStream) setHint("Bulk mode on — tap Capture for each card.");
+    }
+  });
+}
+
+// --- Bulk-mode location picker ---------------------------------------------
+// Only shown in Bulk mode. Lets the user pick one location once; every pending
+// card persisted while bulk is on inherits it (state.bulkLocationId).
+const bulkLocationWrap = document.getElementById("bulk-location-wrap");
+const bulkLocationSelect = document.getElementById("bulk-location");
+const bulkNewLocationBtn = document.getElementById("bulk-new-location");
+
+// Show the picker in bulk mode (and populate it); hide it otherwise.
+function syncBulkLocationVisibility() {
+  if (!bulkLocationWrap) return;
+  if (isBulkMode()) {
+    bulkLocationWrap.hidden = false;
+    populateBulkLocationSelect();
+  } else {
+    bulkLocationWrap.hidden = true;
+  }
+}
+
+// Fill the bulk-location <select> from locationsCache, preserving the current
+// pick. Loads locations from Firestore first if the cache is empty.
+async function populateBulkLocationSelect() {
+  if (!bulkLocationSelect) return;
+  if (FIREBASE_READY && currentUser && locationsCache.length === 0) {
+    await loadLocations();
+  }
+  const current = state.bulkLocationId || "";
+  const opts = [
+    `<option value="">— No location —</option>`,
+    ...locationsCache.map((l) => `<option value="${esc(l.id)}">${esc(l.name)}</option>`),
+  ];
+  bulkLocationSelect.innerHTML = opts.join("");
+  // Keep the selection only if it still resolves to an existing location.
+  const stillValid = current === "" || locationsCache.some((l) => l.id === current);
+  state.bulkLocationId = stillValid && current ? current : null;
+  bulkLocationSelect.value = state.bulkLocationId || "";
+}
+
+if (bulkLocationSelect) {
+  bulkLocationSelect.addEventListener("change", () => {
+    state.bulkLocationId = bulkLocationSelect.value || null;
+  });
+}
+
+if (bulkNewLocationBtn) {
+  bulkNewLocationBtn.addEventListener("click", async () => {
+    if (IS_DEMO || !currentUser) {
+      showToast("Sign in to add locations.", { variant: "error" });
+      return;
+    }
+    const raw = await promptDialog({ title: "New location", label: 'Location name (e.g. "Binder A — Page 3")', placeholder: "Binder A — Page 3", confirmLabel: "Add" });
+    if (raw == null) return;
+    const name = raw.trim();
+    if (!name) return;
+    try {
+      const id = crypto.randomUUID();
+      await setDoc(doc(db, "users", currentUser.uid, "locations", id), {
+        name,
+        createdAt: serverTimestamp(),
+      });
+      locationsCache.push({ id, name });
+      const opt = document.createElement("option");
+      opt.value = id;
+      opt.textContent = name;
+      bulkLocationSelect.appendChild(opt);
+      bulkLocationSelect.value = id;
+      state.bulkLocationId = id;
+    } catch (err) {
+      console.error(err);
+      showToast("Couldn't add that location. Try again.", { variant: "error" });
     }
   });
 }
@@ -1396,7 +1615,14 @@ async function renderCollection() {
   const snap = await getDocs(
     query(collection(db, "users", currentUser.uid, "cards"), orderBy("createdAt", "desc")),
   );
-  cardsCache = snap.docs.map((d) => ({ id: d.id, ...d.data() }));
+  const all = snap.docs.map((d) => ({ id: d.id, ...d.data() }));
+  // Collection = KEPT only. Pending cards (still in the review pool) are hidden;
+  // legacy cards with no status field are treated as kept.
+  cardsCache = all.filter((c) => c.status !== "pending");
+  // Surface the review pool from the same read (no extra query).
+  pendingCount = all.filter((c) => c.status === "pending").length;
+  updateNavBadge();
+  updateReviewSurfaces();
   drawCollection();
 }
 
@@ -1661,6 +1887,228 @@ exportCsvEl.addEventListener("click", () => {
   }
   exportCSV(filtered);
 });
+
+// --- Public view-only share link (owner side) ------------------------------
+// A "Share" panel in the collection view lets the owner mint a public, read-only
+// link (createShareLink), copy it, or revoke it (revokeShareLink). The token is
+// stored at users/{uid}.shareToken; getSharedCollection returns the cards with
+// all dollar values / notes / locations stripped server-side.
+const sharePanelEl = document.getElementById("share-panel");
+const shareToggleEl = document.getElementById("share-btn");
+let shareBusy = false; // guards against double-submits while a callable is running
+
+if (shareToggleEl && sharePanelEl) {
+  shareToggleEl.addEventListener("click", () => {
+    const opening = sharePanelEl.hidden;
+    sharePanelEl.hidden = !opening;
+    shareToggleEl.classList.toggle("active", opening);
+    shareToggleEl.setAttribute("aria-expanded", String(opening));
+    if (opening) loadAndRenderSharePanel();
+  });
+}
+
+// Build the public URL for a token. The app is hash-routed and Firebase Hosting
+// rewrites every path to index.html, so origin + "/#/share/<token>" resolves.
+function shareUrlFor(token) {
+  return `${location.origin}/#/share/${token}`;
+}
+
+// Read the owner's current token (users/{uid}.shareToken) and paint the panel.
+async function loadAndRenderSharePanel() {
+  if (!sharePanelEl) return;
+  if (IS_DEMO || !FIREBASE_READY || !currentUser) {
+    renderSharePanel(null);
+    return;
+  }
+  sharePanelEl.innerHTML = `<p class="muted">Loading…</p>`;
+  let token = null;
+  try {
+    const snap = await getDoc(doc(db, "users", currentUser.uid));
+    token = (snap.exists() && snap.data().shareToken) || null;
+  } catch (err) {
+    console.warn("Couldn't read share token", err);
+  }
+  renderSharePanel(token);
+}
+
+// Render the panel in either the "create" state (no token) or the "active" state
+// (token present: URL + copy + turn-off).
+function renderSharePanel(token) {
+  if (!sharePanelEl) return;
+  if (!token) {
+    sharePanelEl.innerHTML = `
+      <p class="share-explainer">Create a view-only link anyone can open — it shows your cards and details but <strong>NOT your dollar values</strong>. You can turn it off anytime.</p>
+      <button type="button" id="share-create-btn" class="big-button primary">Create link</button>
+    `;
+    const createBtn = document.getElementById("share-create-btn");
+    if (createBtn) createBtn.addEventListener("click", createShare);
+    return;
+  }
+  const url = shareUrlFor(token);
+  sharePanelEl.innerHTML = `
+    <p class="share-explainer">Your collection is shared with a <strong>view-only</strong> link. Anyone with it can see your cards and details — but not your dollar values, notes, or locations.</p>
+    <label class="share-url-label" for="share-url">Share link</label>
+    <input id="share-url" class="share-url" type="text" readonly value="${esc(url)}" aria-label="Share link" />
+    <div class="row">
+      <button type="button" id="share-copy-btn" class="copy-btn" data-copy-target="#share-url">Copy link</button>
+      <button type="button" id="share-revoke-btn" class="big-button danger">Turn off link</button>
+    </div>
+  `;
+  // Select-all on focus so a tap makes the link easy to copy manually too.
+  const urlInput = document.getElementById("share-url");
+  if (urlInput) urlInput.addEventListener("focus", () => urlInput.select());
+  const revokeBtn = document.getElementById("share-revoke-btn");
+  if (revokeBtn) revokeBtn.addEventListener("click", revokeShare);
+}
+
+async function createShare() {
+  if (shareBusy) return;
+  if (IS_DEMO || !FIREBASE_READY || !currentUser) {
+    showToast("Sign in to create a share link.", { variant: "error" });
+    return;
+  }
+  const btn = document.getElementById("share-create-btn");
+  shareBusy = true;
+  if (btn) { btn.disabled = true; btn.textContent = "Creating…"; }
+  try {
+    const callable = httpsCallable(functions, "createShareLink");
+    const res = await callable();
+    const token = res.data && res.data.token;
+    if (!token) throw new Error("No token returned");
+    renderSharePanel(token);
+    showToast("Share link created.", { variant: "success" });
+  } catch (err) {
+    console.error("createShareLink failed", err);
+    showToast("Couldn't create a share link. Try again.", { variant: "error" });
+    if (btn) { btn.disabled = false; btn.textContent = "Create link"; }
+  } finally {
+    shareBusy = false;
+  }
+}
+
+async function revokeShare() {
+  if (shareBusy) return;
+  if (IS_DEMO || !FIREBASE_READY || !currentUser) {
+    showToast("Sign in to manage your share link.", { variant: "error" });
+    return;
+  }
+  const ok = await confirmDialog({
+    title: "Turn off the share link?",
+    message: "Anyone you've sent it to will no longer be able to open it. You can create a new link later.",
+    confirmLabel: "Turn off link",
+    cancelLabel: "Keep it on",
+    danger: true,
+  });
+  if (!ok) return;
+  const btn = document.getElementById("share-revoke-btn");
+  shareBusy = true;
+  if (btn) { btn.disabled = true; btn.textContent = "Turning off…"; }
+  try {
+    const callable = httpsCallable(functions, "revokeShareLink");
+    await callable();
+    renderSharePanel(null);
+    showToast("Share link turned off.", { variant: "success" });
+  } catch (err) {
+    console.error("revokeShareLink failed", err);
+    showToast("Couldn't turn off the link. Try again.", { variant: "error" });
+    if (btn) { btn.disabled = false; btn.textContent = "Turn off link"; }
+  } finally {
+    shareBusy = false;
+  }
+}
+
+// --- Public shared collection viewer (recipient side) ----------------------
+// Read-only gallery rendered for #/share/{token}. getSharedCollection is PUBLIC
+// (no auth), so it's called regardless of the visitor's anonymous sign-in. No
+// prices, notes, locations, edit/delete, or links into the owner's app.
+const shareViewContentEl = document.getElementById("share-view-content");
+
+async function renderSharedView(token) {
+  if (!shareViewContentEl) return;
+  if (!FIREBASE_READY) {
+    shareViewContentEl.innerHTML = `<div class="empty-state"><p>Shared collections aren't available here.</p></div>`;
+    return;
+  }
+  if (!token) {
+    shareViewContentEl.innerHTML = `<div class="empty-state"><p>This share link is no longer active.</p></div>`;
+    return;
+  }
+
+  shareViewContentEl.innerHTML = `<p class="muted">Loading shared collection…</p>`;
+  let data;
+  try {
+    const callable = httpsCallable(functions, "getSharedCollection");
+    const res = await callable({ token });
+    data = res.data || {};
+  } catch (err) {
+    console.warn("getSharedCollection failed", err);
+    // "not-found" → revoked/invalid token. Anything else → generic, friendly.
+    shareViewContentEl.innerHTML = `<div class="empty-state"><p>This share link is no longer active.</p></div>`;
+    return;
+  }
+
+  const cards = Array.isArray(data.cards) ? data.cards : [];
+  const count = typeof data.count === "number" ? data.count : cards.length;
+
+  if (cards.length === 0) {
+    shareViewContentEl.innerHTML = `
+      <div class="share-view-head">
+        <h2 tabindex="-1">Shared collection <span class="share-view-tag">view only</span></h2>
+      </div>
+      <div class="empty-state"><p>This collection doesn't have any cards yet.</p></div>`;
+    focusHeadingEl(shareViewContentEl.querySelector("h2"));
+    return;
+  }
+
+  const tiles = cards.map(renderSharedTile).join("");
+  shareViewContentEl.innerHTML = `
+    <div class="share-view-head">
+      <h2 tabindex="-1">Shared collection <span class="share-view-tag">view only</span></h2>
+      <p class="muted">${count} card${count === 1 ? "" : "s"}</p>
+    </div>
+    <div class="share-grid">${tiles}</div>
+  `;
+  focusHeadingEl(shareViewContentEl.querySelector("h2"));
+}
+
+// One non-clickable read-only tile. Mirrors the .collection-card visual style
+// but is a <div>, not a link into the owner's detail/review routes.
+function renderSharedTile(card) {
+  const c = card || {};
+  const id = c.identified || {};
+  const t = itemTypeOf(c);
+  const name = displayName(c);
+
+  // Meta line: year + set + (team for cards / itemLabel for sealed product).
+  const metaParts = [];
+  if (id.year) metaParts.push(String(id.year));
+  if (id.set) metaParts.push(id.set);
+  if (t === "card") {
+    if (id.team) metaParts.push(id.team);
+  } else if (id.itemLabel) {
+    metaParts.push(id.itemLabel);
+  }
+  const meta = metaParts.filter(Boolean).join(" • ");
+
+  const badges = [];
+  if (t === "card") {
+    if (id.isRookie) badges.push(`<span class="badge rookie">Rookie</span>`);
+    if (id.isHOF) badges.push(`<span class="badge hof">Hall of Fame</span>`);
+  } else if (id.sealed) {
+    badges.push(`<span class="badge sealed">Sealed</span>`);
+  }
+
+  return `
+    <div class="share-card">
+      <img src="${esc(c.imageFrontUrl || "")}" alt="${esc(name)}" loading="lazy" />
+      <div class="info">
+        <div class="name">${esc(name)}</div>
+        ${meta ? `<div class="sub">${esc(meta)}</div>` : ""}
+        ${badges.length ? `<div class="share-card-badges">${badges.join("")}</div>` : ""}
+      </div>
+    </div>
+  `;
+}
 
 // --- CSV export ------------------------------------------------------------
 function exportCSV(cards) {
@@ -2068,6 +2516,325 @@ function populateLocationFilter() {
     locationsCache.some((l) => l.id === current);
   collectionFilters.location = stillValid ? current : "all";
   filterLocationEl.value = collectionFilters.location;
+}
+
+// --- Review view (pending pool) --------------------------------------------
+// Scanned cards are persisted as status:"pending" the moment they're identified
+// (see persistPendingCard). The review flow lets the user Keep or Discard each;
+// the collection only ever shows kept cards.
+const reviewContentEl = document.getElementById("review-content");
+
+// Fetch all pending cards, newest first. Uses a single-field equality query (no
+// orderBy) so it needs NO composite index; we sort newest-first client-side.
+async function fetchPendingCards() {
+  const snap = await getDocs(
+    query(
+      collection(db, "users", currentUser.uid, "cards"),
+      where("status", "==", "pending"),
+    ),
+  );
+  return snap.docs
+    .map((d) => ({ id: d.id, ...d.data() }))
+    .sort((a, b) => tsMs(b.createdAt) - tsMs(a.createdAt));
+}
+
+// Find the next pending card to review after acting on `excludeId`.
+async function nextPendingId(excludeId) {
+  try {
+    const pend = await fetchPendingCards();
+    const next = pend.find((c) => c.id !== excludeId);
+    return next ? next.id : null;
+  } catch (err) {
+    console.warn("Couldn't look up next pending card", err);
+    return null;
+  }
+}
+
+async function renderReview() {
+  if (!reviewContentEl) return;
+  reviewState.cardId = null;
+  reviewState.card = null;
+  reviewState.editing = false;
+
+  if (IS_DEMO || !FIREBASE_READY) {
+    reviewContentEl.innerHTML = `<div class="empty-state"><p>Scanned cards land here for review once you're signed in. (Demo mode shows the sample collection directly.)</p></div>`;
+    return;
+  }
+  if (!currentUser) {
+    reviewContentEl.innerHTML = `<p class="muted">Signing in…</p>`;
+    return;
+  }
+
+  reviewContentEl.innerHTML = `<p class="muted">Loading…</p>`;
+  let pend;
+  try {
+    pend = await fetchPendingCards();
+  } catch (err) {
+    console.error("Couldn't load pending cards", err);
+    reviewContentEl.innerHTML = `<div class="empty-state"><p>Couldn't load cards to review. Try again.</p></div>`;
+    return;
+  }
+
+  pendingCount = pend.length;
+  updateNavBadge();
+  updateReviewSurfaces();
+
+  if (pend.length === 0) {
+    reviewContentEl.innerHTML = `
+      <div class="empty-state">
+        <p>Nothing to review right now. Scanned cards land here until you Keep or Discard them.</p>
+        <a href="#/scan" class="big-button primary cta">Scan a card</a>
+      </div>`;
+    return;
+  }
+
+  const items = pend
+    .map(
+      (c) => `
+        <a class="review-row" href="#/review/${esc(c.id)}">
+          <img src="${esc(c.imageFrontUrl || "")}" alt="" />
+          <div class="review-row-main">
+            <div class="review-row-name">${esc(displayName(c))}</div>
+            <div class="review-row-sub">${reviewRowMeta(c)}</div>
+          </div>
+          <span class="review-row-go" aria-hidden="true">&rarr;</span>
+        </a>`,
+    )
+    .join("");
+
+  reviewContentEl.innerHTML = `
+    <p class="review-count">${pend.length} card${pend.length === 1 ? "" : "s"} to review</p>
+    <div class="review-list">${items}</div>
+  `;
+}
+
+// Short meta line for a pending card in the review list.
+function reviewRowMeta(c) {
+  const id = c.identified || {};
+  const t = itemTypeOf(c);
+  const parts = [];
+  if (id.year) parts.push(String(id.year));
+  if (id.set) parts.push(id.set);
+  if (t === "card") {
+    if (id.cardNumber) parts.push(`#${id.cardNumber}`);
+  } else {
+    parts.push(t === "pack" ? "Sealed pack" : "Sealed box");
+  }
+  return esc(parts.filter(Boolean).join(" • "));
+}
+
+async function renderReviewCard(cardId) {
+  if (!reviewContentEl) return;
+  if (IS_DEMO || !FIREBASE_READY) {
+    location.hash = "#/review";
+    return;
+  }
+  if (!currentUser) {
+    reviewContentEl.innerHTML = `<p class="muted">Signing in…</p>`;
+    return;
+  }
+
+  // Load fresh unless we're re-rendering the same card (e.g. toggling edit).
+  if (reviewState.cardId !== cardId || !reviewState.card) {
+    reviewContentEl.innerHTML = `<p class="muted">Loading…</p>`;
+    let snap;
+    try {
+      snap = await getDoc(doc(db, "users", currentUser.uid, "cards", cardId));
+    } catch (err) {
+      console.error("Couldn't load card to review", err);
+      location.hash = "#/review";
+      return;
+    }
+    if (!snap.exists() || snap.data().status !== "pending") {
+      // Already kept/discarded elsewhere, or gone — back to the list.
+      location.hash = "#/review";
+      return;
+    }
+    reviewState.cardId = cardId;
+    reviewState.card = { id: cardId, ...snap.data() };
+    reviewState.editing = false;
+  }
+
+  await loadLocations();
+
+  if (reviewState.editing) {
+    renderReviewEditing();
+  } else {
+    renderReviewDisplay();
+  }
+}
+
+function renderReviewDisplay() {
+  const c = reviewState.card;
+  const highValue = (c.valueEstimate?.high || 0) >= HIGH_VALUE_THRESHOLD;
+  const uncertain = (c.identified?.confidence || 0) < 0.5 && !c.identified?.userEdited;
+
+  reviewContentEl.innerHTML = `
+    <a class="link-button" href="#/review">&larr; All cards to review</a>
+    <div class="review-banner">Reviewing a scanned card. <strong>Keep</strong> it to add it to your collection, or <strong>Discard</strong> it. It's saved safely until you decide.</div>
+    ${highValue ? `<div class="high-value-banner">This could be worth a closer look — see the Guide before you sell, clean, or grade it.</div>` : ""}
+    ${uncertain ? `<div class="uncertain-banner">The AI wasn't very sure about this one. Tap <strong>Edit details</strong> to correct anything.</div>` : ""}
+    <div class="result-card">
+      ${identifiedSummaryHTML(c)}
+      <div class="value-block">
+        <div class="label muted">Claude AI ballpark</div>
+        <div class="range">$${fmt(c.valueEstimate?.low || 0)} &ndash; $${fmt(c.valueEstimate?.high || 0)}</div>
+        <div class="note">${esc(c.valueEstimate?.note || "")}</div>
+      </div>
+      ${renderEbayBlock(c.ebayPrices)}
+      ${renderPriceLinks(c)}
+      <button id="review-edit-btn" class="link-button" style="margin-top: 10px;">Edit details</button>
+    </div>
+    ${c.locationId && locationName(c.locationId) ? `<div class="location-display"><span aria-hidden="true">📍</span> <strong>Location:</strong> ${esc(locationName(c.locationId))}</div>` : ""}
+    ${c.imageFrontUrl ? `<img src="${esc(c.imageFrontUrl)}" alt="Front" />` : ""}
+    ${c.imageBackUrl ? `<img src="${esc(c.imageBackUrl)}" alt="Back" />` : ""}
+    <div class="row">
+      <button id="review-keep-btn" class="big-button primary">Keep in collection</button>
+      <button id="review-discard-btn" class="big-button">Discard</button>
+    </div>
+  `;
+
+  document.getElementById("review-edit-btn").addEventListener("click", () => {
+    reviewState.editing = true;
+    renderReviewCard(reviewState.cardId);
+  });
+  document.getElementById("review-keep-btn").addEventListener("click", keepReviewedCard);
+  document.getElementById("review-discard-btn").addEventListener("click", discardReviewedCard);
+
+  focusHeadingEl(reviewContentEl.querySelector(".player"));
+}
+
+function renderReviewEditing() {
+  const c = reviewState.card;
+  const type = itemTypeOf(c);
+  const locationOptions = [
+    `<option value="">— No location —</option>`,
+    ...locationsCache.map(
+      (l) => `<option value="${esc(l.id)}" ${c.locationId === l.id ? "selected" : ""}>${esc(l.name)}</option>`,
+    ),
+  ].join("");
+
+  reviewContentEl.innerHTML =
+    renderEditFormHTML(c.identified || {}, type) +
+    `<div class="notes-section">
+       <label for="review-location">Location <span class="muted">(where it's stored)</span></label>
+       <div class="location-pick">
+         <select id="review-location" class="control-select">${locationOptions}</select>
+         <button type="button" id="review-new-location" class="control-btn">+ New</button>
+       </div>
+     </div>
+     <div class="notes-section">
+       <label for="review-notes">Your notes</label>
+       <textarea id="review-notes" placeholder="e.g. From Grandpa's collection">${esc(c.userNotes || "")}</textarea>
+     </div>
+     <div class="row">
+       <button id="review-apply-btn" class="big-button primary">Done editing</button>
+       <button id="review-cancel-btn" class="big-button">Cancel</button>
+     </div>`;
+
+  document.getElementById("review-new-location").addEventListener("click", async () => {
+    const raw = await promptDialog({ title: "New location", label: 'Location name (e.g. "Binder A — Page 3")', placeholder: "Binder A — Page 3", confirmLabel: "Add" });
+    if (raw == null) return;
+    const name = raw.trim();
+    if (!name) return;
+    try {
+      const id = crypto.randomUUID();
+      await setDoc(doc(db, "users", currentUser.uid, "locations", id), {
+        name,
+        createdAt: serverTimestamp(),
+      });
+      locationsCache.push({ id, name });
+      const sel = document.getElementById("review-location");
+      const opt = document.createElement("option");
+      opt.value = id;
+      opt.textContent = name;
+      sel.appendChild(opt);
+      sel.value = id;
+    } catch (err) {
+      console.error(err);
+      showToast("Couldn't add that location. Try again.", { variant: "error" });
+    }
+  });
+
+  // "Done editing" folds the edits back into reviewState.card (kept in memory)
+  // without writing yet — the write happens on Keep, so a Discard doesn't persist
+  // pointless edits.
+  document.getElementById("review-apply-btn").addEventListener("click", () => {
+    reviewState.card = {
+      ...c,
+      identified: { ...c.identified, ...readEditFormValues(type), userEdited: true },
+      userNotes: document.getElementById("review-notes").value || null,
+      locationId: document.getElementById("review-location").value || null,
+    };
+    reviewState.editing = false;
+    renderReviewCard(reviewState.cardId);
+  });
+  document.getElementById("review-cancel-btn").addEventListener("click", () => {
+    reviewState.editing = false;
+    renderReviewCard(reviewState.cardId);
+  });
+
+  focusHeadingEl(reviewContentEl.querySelector(".edit-title"));
+}
+
+async function keepReviewedCard() {
+  const c = reviewState.card;
+  if (!c) return;
+  const keepBtn = document.getElementById("review-keep-btn");
+  if (keepBtn) { keepBtn.disabled = true; keepBtn.textContent = "Saving…"; }
+  try {
+    await updateDoc(doc(db, "users", currentUser.uid, "cards", c.id), {
+      status: "kept",
+      identified: c.identified || {},
+      userNotes: c.userNotes || null,
+      locationId: c.locationId || null,
+    });
+  } catch (err) {
+    console.error("Couldn't keep card", err);
+    showToast("Couldn't save that. Try again.", { variant: "error" });
+    if (keepBtn) { keepBtn.disabled = false; keepBtn.textContent = "Keep in collection"; }
+    return;
+  }
+  showToast("Kept in your collection.", { variant: "success" });
+  await advanceAfterReview(c.id, "#/collection");
+}
+
+async function discardReviewedCard() {
+  const c = reviewState.card;
+  if (!c) return;
+  const ok = await confirmDialog({
+    title: "Discard this card?",
+    message: "It won't be added to your collection and its photos will be removed.",
+    confirmLabel: "Discard",
+    cancelLabel: "Keep reviewing",
+    danger: true,
+  });
+  if (!ok) return;
+  try {
+    // The deployed onCardDeleted trigger removes the card's Storage images.
+    await deleteDoc(doc(db, "users", currentUser.uid, "cards", c.id));
+  } catch (err) {
+    console.error("Couldn't discard card", err);
+    showToast("Couldn't discard that. Try again.", { variant: "error" });
+    return;
+  }
+  await advanceAfterReview(c.id, "#/review");
+}
+
+// After Keep/Discard: clear review state, refresh the pending count, then move
+// to the next pending card if there is one, else the given fallback route.
+async function advanceAfterReview(actedId, fallbackHash) {
+  reviewState.cardId = null;
+  reviewState.card = null;
+  reviewState.editing = false;
+  const nextId = await nextPendingId(actedId);
+  await refreshPendingCount();
+  if (nextId) {
+    location.hash = `#/review/${nextId}`;
+    // If the hash didn't change (shouldn't happen for distinct ids), force a render.
+  } else {
+    location.hash = fallbackHash;
+  }
 }
 
 // --- In-app dialogs (replaces native alert/confirm/prompt) -----------------

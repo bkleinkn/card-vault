@@ -26,6 +26,7 @@
   <main id="view-root">
     <!-- Scan view -->
     <section class="view" data-view="scan">
+      <div class="review-cta" hidden></div>
       <div class="scan-hero">
         <h2>Scan an item</h2>
         <p class="muted">Tap <strong>Open camera</strong>, fill the frame with the item, then tap <strong>Capture</strong>. Good light helps.</p>
@@ -48,6 +49,17 @@
           <small>Keep the camera open and snap card after card &mdash; each one identifies in the background, then waits for you to review.</small>
         </span>
       </label>
+
+      <!-- Bulk-mode location: pick once, applied to every card in the batch -->
+      <div id="bulk-location-wrap" class="bulk-location" hidden>
+        <label for="bulk-location">Put this whole batch in</label>
+        <div class="location-pick">
+          <select id="bulk-location" class="control-select">
+            <option value="">— No location —</option>
+          </select>
+          <button type="button" id="bulk-new-location" class="control-btn">+ New</button>
+        </div>
+      </div>
 
       <div id="camera-stage" class="camera-stage" hidden>
         <video id="camera-video" playsinline muted autoplay></video>
@@ -103,8 +115,15 @@
       </div>
     </section>
 
+    <!-- Review view (pending pool) -->
+    <section class="view" data-view="review" hidden>
+      <h2>Needs review</h2>
+      <div id="review-content"></div>
+    </section>
+
     <!-- Collection view -->
     <section class="view" data-view="collection" hidden>
+      <div class="review-cta" hidden></div>
       <div class="collection-header">
         <h2>My collection</h2>
         <p id="collection-total" class="muted"></p>
@@ -128,7 +147,9 @@
         </select>
         <button id="filters-toggle" type="button" class="control-btn" aria-controls="filters-panel" aria-expanded="false">Filters</button>
         <button id="export-csv" type="button" class="control-btn">Export CSV</button>
+        <button id="share-btn" type="button" class="control-btn" aria-controls="share-panel" aria-expanded="false">Share</button>
       </div>
+      <div id="share-panel" class="share-panel" hidden></div>
       <div id="filters-panel" class="filters-panel" hidden>
         <div class="filters-row">
           <label class="filter-field">Type
@@ -183,6 +204,11 @@
     <section class="view" data-view="detail" hidden>
       <button id="back-btn" class="link-button">&larr; Back</button>
       <div id="detail-content"></div>
+    </section>
+
+    <!-- Public shared collection view (view-only, no auth required) -->
+    <section class="view" data-view="share" hidden>
+      <div id="share-view-content"></div>
     </section>
 
     <!-- Locations view -->
@@ -351,6 +377,7 @@
 
   <nav class="bottomnav" role="navigation" aria-label="Main">
     <a href="#/scan" class="navlink" data-nav="scan">Scan</a>
+    <a href="#/review" class="navlink" data-nav="review">Review</a>
     <a href="#/collection" class="navlink" data-nav="collection">Collection</a>
     <a href="#/locations" class="navlink" data-nav="locations">Locations</a>
     <a href="#/guide" class="navlink" data-nav="guide">Guide</a>

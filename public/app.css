@@ -647,6 +647,128 @@ p { color: var(--ink-soft); margin: 8px 0; }
   color: var(--accent-soft);
 }
 
+/* ---------- "Needs review" CTA banner (scan + collection views) ---------- */
+.review-cta { margin: 0 0 16px; }
+.review-cta-link {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  min-height: var(--tap);
+  padding: 12px 16px;
+  background: var(--warn-bg);
+  border: 1px solid var(--warn-border);
+  border-left: 3px solid var(--amber);
+  border-radius: var(--radius-sm);
+  color: var(--warn-text);
+  font-size: 14px;
+  font-weight: 700;
+  letter-spacing: 0.01em;
+  text-decoration: none;
+  transition: background .15s, border-color .15s;
+}
+.review-cta-link:hover {
+  background: rgba(245, 158, 11, 0.16);
+  border-color: var(--amber);
+  color: var(--amber-soft);
+  text-decoration: none;
+}
+
+/* ---------- Bulk-mode location picker ---------- */
+.bulk-location {
+  margin: 0 0 14px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 12px 14px;
+}
+.bulk-location > label {
+  display: block;
+  margin-bottom: 8px;
+  font-size: 13px;
+  font-weight: 700;
+  color: var(--ink-faint);
+  letter-spacing: 0.01em;
+}
+
+/* ---------- Review view (pending pool) ---------- */
+.review-count {
+  font-size: 12px;
+  font-family: var(--font-mono);
+  font-weight: 600;
+  color: var(--ink-faint);
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  margin: 0 0 12px;
+}
+.review-list {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.review-row {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  padding: 10px 14px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  text-decoration: none;
+  color: var(--ink);
+  transition: border-color .15s, transform .1s, box-shadow .15s;
+}
+.review-row:hover {
+  border-color: var(--accent);
+  transform: translateY(-1px);
+  box-shadow: 0 6px 18px rgba(0, 0, 0, 0.35), 0 0 0 1px var(--accent-glow);
+  text-decoration: none;
+}
+.review-row img {
+  flex: 0 0 auto;
+  width: 54px;
+  height: 74px;
+  object-fit: cover;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border-strong);
+  background: var(--surface-2);
+}
+.review-row-main { flex: 1; min-width: 0; }
+.review-row-name {
+  font-weight: 600;
+  font-size: 15px;
+  color: var(--ink);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.review-row-sub {
+  font-size: 12px;
+  font-family: var(--font-mono);
+  color: var(--ink-faint);
+  margin-top: 3px;
+  letter-spacing: 0.03em;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.review-row-go {
+  flex: 0 0 auto;
+  color: var(--ink-faint);
+  font-size: 18px;
+  font-weight: 700;
+}
+#review-content img[alt="Front"],
+#review-content img[alt="Back"] {
+  width: 100%;
+  max-width: 360px;
+  border-radius: var(--radius);
+  border: 1px solid var(--border);
+  display: block;
+  margin: 12px auto;
+  background: var(--surface);
+}
+
 /* Count badge on the Scan nav tab */
 .nav-badge {
   position: absolute;
@@ -1539,6 +1661,148 @@ p { color: var(--ink-soft); margin: 8px 0; }
   color: var(--success-text);
 }
 
+/* ---------- Share panel (owner side, collection view) ---------- */
+.share-panel {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 16px;
+  margin: 0 0 12px;
+}
+
+.share-explainer {
+  font-size: 14px;
+  color: var(--ink-soft);
+  line-height: 1.5;
+  margin: 0 0 12px;
+}
+.share-explainer strong { color: var(--ink-2); }
+
+.share-url-label {
+  display: block;
+  margin-bottom: 6px;
+  font-size: 13px;
+  font-weight: 700;
+  color: var(--ink-faint);
+  letter-spacing: 0.01em;
+}
+
+.share-url {
+  width: 100%;
+  min-height: var(--tap);
+  padding: 10px 12px;
+  font-size: 13px;
+  font-family: var(--font-mono);
+  background: var(--bg);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  color: var(--ink-2);
+  margin: 0 0 10px;
+  transition: border-color .15s, box-shadow .15s;
+}
+.share-url:focus {
+  outline: none;
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-glow);
+}
+
+/* In the share panel both buttons sit in a .row; keep them equal-width and
+   align the copy button's height/margins with the danger button. */
+.share-panel .row { margin-top: 0; }
+.share-panel .row .copy-btn { flex: 1; margin: 0; }
+.share-panel .row .big-button { flex: 1; margin: 0; }
+
+/* ---------- Public shared collection view (recipient side) ---------- */
+.share-view-head {
+  margin-bottom: 16px;
+}
+.share-view-head h2 { margin: 0 0 4px; }
+
+.share-view-tag {
+  display: inline-block;
+  vertical-align: middle;
+  margin-left: 10px;
+  font-size: 11px;
+  font-weight: 700;
+  font-family: var(--font-mono);
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--accent-soft);
+  background: var(--info-bg);
+  border: 1px solid var(--info-border);
+  padding: 3px 10px;
+  border-radius: var(--radius-pill);
+}
+
+.share-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
+  gap: 12px;
+}
+
+/* Read-only tile — visually matches .collection-card but is not a link. */
+.share-card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+  color: var(--ink);
+}
+
+.share-card img {
+  width: 100%;
+  aspect-ratio: 5/7;
+  object-fit: cover;
+  background: var(--bg);
+  display: block;
+}
+
+.share-card .info {
+  padding: 10px 12px;
+  border-top: 1px solid var(--border);
+}
+
+.share-card .info .name {
+  font-weight: 600;
+  font-size: 14px;
+  color: var(--ink);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  letter-spacing: -0.01em;
+}
+
+.share-card .info .sub {
+  font-size: 11px;
+  font-family: var(--font-mono);
+  color: var(--ink-faint);
+  margin-top: 2px;
+  letter-spacing: 0.04em;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.share-card-badges {
+  display: flex;
+  gap: 4px;
+  flex-wrap: wrap;
+  margin-top: 8px;
+}
+.share-card-badges .badge {
+  font-size: 9px;
+  padding: 3px 7px;
+  letter-spacing: 0.04em;
+}
+
+/* When viewing a public share link, strip the owner's app chrome so a recipient
+   can't wander into the (empty, for them) signed-in app. */
+body.viewing-share .bottomnav,
+body.viewing-share .topbar-right { display: none; }
+body.viewing-share { padding-bottom: 28px; }
+
 /* ---------- Bottom nav ---------- */
 .bottomnav {
   position: fixed;
@@ -1926,6 +2190,9 @@ p { color: var(--ink-soft); margin: 8px 0; }
   .collection-controls { flex-wrap: wrap; }
   .control-select { min-width: 100%; }
   .control-btn { flex: 1; min-width: 130px; }
+  /* Five bottom-nav items get tight on phones — shrink the chrome to fit. */
+  .navlink { font-size: 12px; letter-spacing: 0.01em; padding: 16px 2px; }
+  .bulk-location .location-pick { flex-wrap: wrap; }
 }
 
 /* ---------- Reduced motion (a11y) ----------
