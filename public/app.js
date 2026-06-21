@@ -745,14 +745,25 @@ async function runJob(job) {
   // whether to auto-open the review screen.
   let wasWaiting = QUEUE.waitingJobId === job.id;
   try {
-    const result = await identifyCard(job.frontFile, job.backFile, job.itemType);
+    // Identify, but never let a FAILED identify lose the scan. When signed in we
+    // persist the card either way (below) so the user can identify it later from
+    // the review screen; only the demo / pre-auth path treats it as an error.
+    let result = null;
+    let identifyFailed = false;
+    try {
+      result = await identifyCard(job.frontFile, job.backFile, job.itemType);
+    } catch (ierr) {
+      console.warn("Background identify failed — saving the scan to identify later", ierr);
+      result = null;
+      identifyFailed = true;
+    }
     if (!QUEUE.jobs.includes(job)) return; // discarded mid-flight
     job.result = result;
 
-    // Durability: the moment we have an identify result, write it to Firestore
-    // as a PENDING card (images uploaded first) so nothing is lost if the page
-    // is discarded during review. Only when signed in — demo / pre-auth keeps
-    // the in-memory "ready" + result-view Save fallback.
+    // Durability: write the scan to Firestore as a PENDING card (images uploaded
+    // first) so nothing is lost if the page is discarded during review — and so a
+    // failed identify is still recoverable. Only when signed in — demo / pre-auth
+    // keeps the in-memory "ready" + result-view Save fallback.
     if (FIREBASE_READY && currentUser) {
       wasBulk = isBulkMode();
       // Re-read in case the user tapped "Scan next" while identify was running.
@@ -765,19 +776,25 @@ async function runJob(job) {
         // It now lives in Firestore; drop it from the in-memory queue.
         removeJob(job.id);
       } catch (perr) {
+        // A persist/upload failure is the only thing that loses the scan, so this
+        // is the one path that keeps the File in memory for retry.
         console.error("Persisting scan failed", perr);
         if (!QUEUE.jobs.includes(job)) return;
-        // Keep the File in memory and let the user retry — never lose the scan.
         job.status = "error";
         job.error = perr;
         outcome = "error";
       }
+    } else if (identifyFailed) {
+      // Demo / not signed in: nothing to persist to, so surface the failure.
+      job.status = "error";
+      job.error = new Error("Couldn't identify this scan.");
+      outcome = "error";
     } else {
       job.status = "ready";
       outcome = "ready";
     }
   } catch (err) {
-    console.error("Background identify failed", err);
+    console.error("Background scan job failed", err);
     if (!QUEUE.jobs.includes(job)) return;
     job.status = "error";
     job.error = err;
@@ -813,6 +830,11 @@ async function persistPendingCard(job) {
   const frontUrl = await uploadImage(job.frontFile, cardId, "front");
   const backUrl = job.backFile ? await uploadImage(job.backFile, cardId, "back") : null;
   const result = job.result || {};
+  // "Needs identifying" when there's no real identification to show — either the
+  // identify call failed (result is null) or the model couldn't read the item.
+  const needsIdentify = !(
+    result && result.identified && (result.identified.player || result.identified.itemLabel)
+  );
   await setDoc(doc(db, "users", currentUser.uid, "cards", cardId), {
     createdAt: serverTimestamp(),
     status: "pending",
@@ -822,6 +844,7 @@ async function persistPendingCard(job) {
     identified: result.identified || {},
     valueEstimate: result.valueEstimate || null,
     ebayPrices: result.ebayPrices || null,
+    needsIdentify,
     locationId: state.bulkLocationId || null,
     userNotes: null,
   });
@@ -1195,6 +1218,15 @@ async function identifyCard(frontFile, backFile, itemType = "card") {
   return res.data;
 }
 
+// Re-run identification on an already-saved card, server-side, from the image
+// stored in Cloud Storage. Used by the review screen's "Identify with AI" button
+// for cards that were saved without a (successful) identification.
+async function identifyStoredCard(cardId) {
+  const callable = httpsCallable(functions, "identifyStored");
+  const res = await callable({ cardId });
+  return res.data;
+}
+
 async function mockIdentify(itemType = "card") {
   await new Promise((r) => setTimeout(r, 800));
   if (itemType === "pack") {
@@ -1296,6 +1328,16 @@ function displayName(data) {
   if (t === "pack") return id.itemLabel || "Card pack";
   if (t === "box") return id.itemLabel || "Card box";
   return id.player || "Unknown";
+}
+
+// True when a card has no real identification to show — either it was saved
+// after a failed identify (needsIdentify flag) or the model produced nothing
+// usable (no player and no itemLabel). Drives the "needs identifying" UI.
+function isUnidentified(data) {
+  if (!data) return true;
+  if (data.needsIdentify) return true;
+  const id = data.identified || {};
+  return !id.player && !id.itemLabel;
 }
 
 // Small secondary line under each collection tile.
@@ -2589,17 +2631,22 @@ async function renderReview() {
   }
 
   const items = pend
-    .map(
-      (c) => `
+    .map((c) => {
+      const unidentified = isUnidentified(c);
+      const name = unidentified ? "Unidentified card" : displayName(c);
+      const sub = unidentified
+        ? `<span class="review-needs-id">Needs identifying</span>`
+        : reviewRowMeta(c);
+      return `
         <a class="review-row" href="#/review/${esc(c.id)}">
           <img src="${esc(c.imageFrontUrl || "")}" alt="" />
           <div class="review-row-main">
-            <div class="review-row-name">${esc(displayName(c))}</div>
-            <div class="review-row-sub">${reviewRowMeta(c)}</div>
+            <div class="review-row-name">${esc(name)}</div>
+            <div class="review-row-sub">${sub}</div>
           </div>
           <span class="review-row-go" aria-hidden="true">&rarr;</span>
-        </a>`,
-    )
+        </a>`;
+    })
     .join("");
 
   reviewContentEl.innerHTML = `
@@ -2666,15 +2713,20 @@ async function renderReviewCard(cardId) {
 
 function renderReviewDisplay() {
   const c = reviewState.card;
+  const unidentified = isUnidentified(c);
   const highValue = (c.valueEstimate?.high || 0) >= HIGH_VALUE_THRESHOLD;
-  const uncertain = (c.identified?.confidence || 0) < 0.5 && !c.identified?.userEdited;
+  const uncertain = !unidentified && (c.identified?.confidence || 0) < 0.5 && !c.identified?.userEdited;
 
-  reviewContentEl.innerHTML = `
-    <a class="link-button" href="#/review">&larr; All cards to review</a>
-    <div class="review-banner">Reviewing a scanned card. <strong>Keep</strong> it to add it to your collection, or <strong>Discard</strong> it. It's saved safely until you decide.</div>
-    ${highValue ? `<div class="high-value-banner">This could be worth a closer look — see the Guide before you sell, clean, or grade it.</div>` : ""}
-    ${uncertain ? `<div class="uncertain-banner">The AI wasn't very sure about this one. Tap <strong>Edit details</strong> to correct anything.</div>` : ""}
-    <div class="result-card">
+  // For an unidentified card the value/eBay blocks are empty noise — replace the
+  // identification body with a clear notice and an "Identify with AI" action.
+  const resultBody = unidentified
+    ? `
+      <p class="player">Unidentified card</p>
+      <div class="uncertain-banner">We couldn't read this card automatically. Edit the details by hand, or try the AI again.</div>
+      <button id="review-ai-btn" class="big-button primary">✦ Identify with AI</button>
+      <button id="review-edit-btn" class="link-button" style="margin-top: 10px;">Edit details by hand</button>
+    `
+    : `
       ${identifiedSummaryHTML(c)}
       <div class="value-block">
         <div class="label muted">Claude AI ballpark</div>
@@ -2684,6 +2736,15 @@ function renderReviewDisplay() {
       ${renderEbayBlock(c.ebayPrices)}
       ${renderPriceLinks(c)}
       <button id="review-edit-btn" class="link-button" style="margin-top: 10px;">Edit details</button>
+    `;
+
+  reviewContentEl.innerHTML = `
+    <a class="link-button" href="#/review">&larr; All cards to review</a>
+    <div class="review-banner">Reviewing a scanned card. <strong>Keep</strong> it to add it to your collection, or <strong>Discard</strong> it. It's saved safely until you decide.</div>
+    ${highValue ? `<div class="high-value-banner">This could be worth a closer look — see the Guide before you sell, clean, or grade it.</div>` : ""}
+    ${uncertain ? `<div class="uncertain-banner">The AI wasn't very sure about this one. Tap <strong>Edit details</strong> to correct anything.</div>` : ""}
+    <div class="result-card">
+      ${resultBody}
     </div>
     ${c.locationId && locationName(c.locationId) ? `<div class="location-display"><span aria-hidden="true">📍</span> <strong>Location:</strong> ${esc(locationName(c.locationId))}</div>` : ""}
     ${c.imageFrontUrl ? `<img src="${esc(c.imageFrontUrl)}" alt="Front" />` : ""}
@@ -2701,7 +2762,34 @@ function renderReviewDisplay() {
   document.getElementById("review-keep-btn").addEventListener("click", keepReviewedCard);
   document.getElementById("review-discard-btn").addEventListener("click", discardReviewedCard);
 
+  const aiBtn = document.getElementById("review-ai-btn");
+  if (aiBtn) aiBtn.addEventListener("click", retryIdentifyReviewedCard);
+
   focusHeadingEl(reviewContentEl.querySelector(".player"));
+}
+
+// "Identify with AI" on a saved-but-unidentified card: ask the server to re-run
+// identification from the stored image, then reload + re-render the card. The
+// manual Edit + Keep path still works if this fails (e.g. IAM not yet granted).
+async function retryIdentifyReviewedCard() {
+  const c = reviewState.card;
+  if (!c) return;
+  const aiBtn = document.getElementById("review-ai-btn");
+  if (aiBtn) { aiBtn.disabled = true; aiBtn.textContent = "Identifying…"; }
+  try {
+    await identifyStoredCard(c.id);
+  } catch (err) {
+    console.error("Couldn't identify stored card", err);
+    showToast("Couldn't identify it just now. You can edit the details by hand and Keep it.", { variant: "error" });
+    if (aiBtn) { aiBtn.disabled = false; aiBtn.textContent = "✦ Identify with AI"; }
+    return;
+  }
+  // Force a fresh read of the now-updated doc, then re-render the review screen.
+  reviewState.cardId = null;
+  reviewState.card = null;
+  reviewState.editing = false;
+  showToast("Identified — review the details.", { variant: "success" });
+  await renderReviewCard(c.id);
 }
 
 function renderReviewEditing() {
@@ -2760,9 +2848,12 @@ function renderReviewEditing() {
   // without writing yet — the write happens on Keep, so a Discard doesn't persist
   // pointless edits.
   document.getElementById("review-apply-btn").addEventListener("click", () => {
+    const editedIdentified = { ...c.identified, ...readEditFormValues(type), userEdited: true };
     reviewState.card = {
       ...c,
-      identified: { ...c.identified, ...readEditFormValues(type), userEdited: true },
+      identified: editedIdentified,
+      // Once the user has hand-entered a name/label, it's no longer "unidentified".
+      needsIdentify: !(editedIdentified.player || editedIdentified.itemLabel),
       userNotes: document.getElementById("review-notes").value || null,
       locationId: document.getElementById("review-location").value || null,
     };
@@ -2786,6 +2877,7 @@ async function keepReviewedCard() {
     await updateDoc(doc(db, "users", currentUser.uid, "cards", c.id), {
       status: "kept",
       identified: c.identified || {},
+      needsIdentify: isUnidentified(c),
       userNotes: c.userNotes || null,
       locationId: c.locationId || null,
     });

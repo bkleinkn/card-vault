@@ -758,6 +758,11 @@ p { color: var(--ink-soft); margin: 8px 0; }
   font-size: 18px;
   font-weight: 700;
 }
+/* Marker in the review list for a saved-but-not-yet-identified card. */
+.review-needs-id {
+  color: var(--warn-text);
+  font-weight: 600;
+}
 #review-content img[alt="Front"],
 #review-content img[alt="Back"] {
   width: 100%;
