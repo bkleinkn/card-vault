@@ -31,7 +31,7 @@
       "source": "functions",
       "codebase": "default",
       "ignore": ["node_modules", ".git", "*.log"],
-      "runtime": "nodejs20"
+      "runtime": "nodejs22"
     }
   ]
 }
