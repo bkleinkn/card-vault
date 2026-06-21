@@ -52,7 +52,7 @@
       <div id="camera-stage" class="camera-stage" hidden>
         <video id="camera-video" playsinline muted autoplay></video>
         <div class="camera-guide" aria-hidden="true"></div>
-        <div id="camera-hint" class="camera-hint">Starting camera&hellip;</div>
+        <div id="camera-hint" class="camera-hint" aria-live="polite" aria-atomic="true">Starting camera&hellip;</div>
       </div>
 
       <button id="enable-camera-btn" class="big-button primary" hidden>Enable camera</button>
@@ -114,13 +114,19 @@
         <select id="collection-sort" class="control-select" aria-label="Sort">
           <option value="newest">Newest first</option>
           <option value="oldest">Oldest first</option>
-          <option value="highest-value">Highest value</option>
-          <option value="lowest-value">Lowest value</option>
+          <optgroup label="Price — high end of range">
+            <option value="high-desc">High end: highest first</option>
+            <option value="high-asc">High end: lowest first</option>
+          </optgroup>
+          <optgroup label="Price — low end of range">
+            <option value="low-desc">Low end: highest first</option>
+            <option value="low-asc">Low end: lowest first</option>
+          </optgroup>
           <option value="newest-cards">Newest cards (year)</option>
           <option value="oldest-cards">Oldest cards (year)</option>
           <option value="player-az">Player A&ndash;Z</option>
         </select>
-        <button id="filters-toggle" type="button" class="control-btn">Filters</button>
+        <button id="filters-toggle" type="button" class="control-btn" aria-controls="filters-panel" aria-expanded="false">Filters</button>
         <button id="export-csv" type="button" class="control-btn">Export CSV</button>
       </div>
       <div id="filters-panel" class="filters-panel" hidden>
@@ -233,6 +239,7 @@
 
       <h3>Your privacy</h3>
       <p>Your card photos and collection are stored privately under your account on Google's Firebase platform. Only you can see them. Card images are sent to Anthropic's Claude API for identification, then immediately forgotten by the model &mdash; Anthropic does not retain them or train on them (see their <a href="https://www.anthropic.com/legal/aup" target="_blank" rel="noopener">usage policy</a>).</p>
+      <p style="background: var(--info-bg); border: 1px solid var(--info-border); border-left: 3px solid var(--accent); padding: 12px 16px; border-radius: 8px; margin: 14px 0;"><strong>One important thing to know:</strong> &nbsp;you're signed in automatically, and that sign-in is tied to <strong>this browser on this device</strong>. That means clearing your browser's history or site data, switching to a different device or browser, or using private/incognito browsing can make your saved collection look like it's gone. To keep a safe backup, use the <strong>Export CSV</strong> button on your collection &mdash; it saves a copy you can keep on your computer.</p>
 
       <p class="muted" style="margin-top: 32px;">Made for collectors and for families going through inherited collections.</p>
     </section>

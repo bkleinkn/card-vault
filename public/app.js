@@ -1,7 +1,8 @@
 // Card Vault — main client script.
-// Phase 1 ships with a mocked identify response so the camera/UX loop
-// can be proven on a real phone before any Cloud Function or OpenAI cost.
-// Phase 2 swaps `mockIdentify` for a fetch to the deployed identifyCard function.
+// Identify runs through the deployed `identifyCard` Cloud Function, which calls
+// Claude (Anthropic) and returns structured JSON. A local `mockIdentify`
+// response is retained behind the USE_MOCK_AI flag for cost-free UX iteration
+// and as a fallback before sign-in / when Firebase isn't wired.
 
 import { initializeApp } from "https://www.gstatic.com/firebasejs/10.13.2/firebase-app.js";
 import {
@@ -63,7 +64,9 @@ if (FIREBASE_READY) {
   onAuthStateChanged(auth, (user) => {
     currentUser = user;
     document.getElementById("user-chip").textContent = user ? "Signed in" : "";
-    if (location.hash === "#/collection") renderCollection();
+    // Re-render whatever view is active (detail, locations, collection) now that
+    // currentUser is known — fixes the detail view dead-ending on "Signing in…".
+    route();
   });
 
   signInAnonymously(auth).catch((err) => {
@@ -74,7 +77,20 @@ if (FIREBASE_READY) {
   document.getElementById("user-chip").textContent = "Demo mode";
 }
 
+// IS_DEMO is true only when Firebase isn't configured. In production
+// (FIREBASE_READY === true) it is always false, so the demo subsystem below
+// (SAMPLE_CARDS, demo banners) is effectively dead code on the live site — kept
+// for local/offline development. Left in place deliberately; do not rely on it
+// in production.
 const IS_DEMO = !FIREBASE_READY;
+
+// Value at/above which we surface the "worth a closer look" banner. Kept in one
+// place so the result and detail views can't drift apart.
+const HIGH_VALUE_THRESHOLD = 250;
+
+// Object URLs created for the scan-view previews. Tracked module-wide so each
+// render (and a reset) can revoke the previous ones instead of leaking blobs.
+let previewUrls = [];
 
 // --- State -----------------------------------------------------------------
 const state = {
@@ -259,12 +275,38 @@ SAMPLE_CARDS.push(
 
 // --- Routing ---------------------------------------------------------------
 function showView(name) {
+  let active = null;
   document.querySelectorAll(".view").forEach((v) => {
-    v.hidden = v.dataset.view !== name;
+    const match = v.dataset.view === name;
+    v.hidden = !match;
+    if (match) active = v;
   });
   document.querySelectorAll(".navlink").forEach((a) => {
     a.classList.toggle("active", a.dataset.nav === name);
   });
+  // a11y: move focus to the view's heading so screen-reader / keyboard users
+  // land in the new view instead of being stranded where they were.
+  focusViewHeading(active);
+}
+
+// Move focus to the first <h2> inside the given container (the active view).
+// Used on every view change; result/detail re-render their innerHTML after
+// showView, so those call focusHeadingEl again once their heading exists.
+function focusViewHeading(container) {
+  if (!container) return;
+  focusHeadingEl(container.querySelector("h2"));
+}
+
+// Make an element programmatically focusable (tabindex=-1) and focus it.
+// Detail content has no static <h2>, so callers pass its headline (.player).
+function focusHeadingEl(h) {
+  if (!h) return;
+  if (!h.hasAttribute("tabindex")) h.setAttribute("tabindex", "-1");
+  try {
+    h.focus({ preventScroll: false });
+  } catch (_) {
+    h.focus();
+  }
 }
 
 function route() {
@@ -283,7 +325,15 @@ function route() {
     showView("detail");
     renderDetail(id);
   } else if (hash.startsWith("#/result")) {
-    showView("result");
+    // Re-render from current state so a back/forward nav can't show stale DOM;
+    // with nothing to show, fall back to the scan view.
+    if (state.lastIdentified) {
+      showView("result");
+      renderResult(state.lastIdentified);
+    } else {
+      location.hash = "#/scan";
+      return;
+    }
   } else if (hash.startsWith("#/locations")) {
     showView("locations");
     renderLocations();
@@ -314,7 +364,7 @@ captureFrontInput.addEventListener("change", (e) => {
   if (!files.length) return;
   // Multiple files selected, or bulk mode on → drop them all into the queue
   // instead of the single-card preview/Identify path.
-  if (files.length > 1 || QUEUE.bulk) {
+  if (files.length > 1 || isBulkMode()) {
     files.forEach((f) => enqueueScan(f));
     captureFrontInput.value = "";
     scanStatus.textContent = `Added ${files.length} card${files.length > 1 ? "s" : ""} to the queue below.`;
@@ -353,17 +403,24 @@ function itemNoun(t) {
 }
 
 function renderPreviews() {
+  // Revoke any object URLs from a previous render before creating new ones.
+  previewUrls.forEach((u) => URL.revokeObjectURL(u));
+  previewUrls = [];
   previewsEl.innerHTML = "";
   if (state.frontFile) {
     const img = document.createElement("img");
     img.alt = "Front";
-    img.src = URL.createObjectURL(state.frontFile);
+    const u = URL.createObjectURL(state.frontFile);
+    previewUrls.push(u);
+    img.src = u;
     previewsEl.appendChild(img);
   }
   if (state.backFile) {
     const img = document.createElement("img");
     img.alt = "Back";
-    img.src = URL.createObjectURL(state.backFile);
+    const u = URL.createObjectURL(state.backFile);
+    previewUrls.push(u);
+    img.src = u;
     previewsEl.appendChild(img);
   }
   // The button is the manual trigger for the file-upload fallback; the live
@@ -383,6 +440,10 @@ async function runIdentify() {
     state.lastIdentified = result;
     state.editingResult = false;
     state.reviewJobId = null;
+    // Fresh manual identify — clear any notes carried over from a prior card
+    // (mirrors reviewJob, which restores per-job notes instead).
+    state.notes = "";
+    resultNotesEl.value = "";
     renderResult(result);
     scanStatus.textContent = "";
     location.hash = "#/result";
@@ -486,7 +547,7 @@ async function startScanCamera() {
   cameraFallback.hidden = false;      // keep the escape hatch reachable, collapsed
   scanStatus.textContent = "";
   setHint(
-    QUEUE.bulk
+    isBulkMode()
       ? "Bulk mode — tap Capture for each card, one after another."
       : "Fill the frame with the card, then tap Capture",
   );
@@ -528,7 +589,7 @@ async function captureAndIdentify() {
     return;
   }
   const job = enqueueScan(file);
-  if (QUEUE.bulk) {
+  if (isBulkMode()) {
     // Bulk mode: keep streaming, just confirm the grab and let it process.
     setHint(`Added ✓ — ${QUEUE.jobs.length} in queue. Snap the next card.`);
     capturing = false;
@@ -555,6 +616,9 @@ document.addEventListener("visibilitychange", () => {
   if (document.hidden) {
     stopScanCamera();
   } else if (!capturing && (location.hash || "#/scan").startsWith("#/scan")) {
+    // A single-mode job is still in flight (its "Identifying…" panel is up and
+    // will auto-open when ready) — don't wipe it by resetting to the camera.
+    if (QUEUE.waitingJobId) return;
     showCameraStart();
   }
 });
@@ -568,9 +632,17 @@ const scanProcessingEl = document.getElementById("scan-processing");
 const scanQueueEl = document.getElementById("scan-queue");
 const bulkToggleEl = document.getElementById("bulk-toggle");
 
+// Bulk mode is read straight from the checkbox so the on-screen toggle and the
+// capture behavior can never drift apart. A cached boolean used to desync from
+// the DOM: browsers restore a checkbox's checked state across a reload (e.g. the
+// service-worker auto-reload on deploy) WITHOUT firing a `change` event, which
+// left the toggle visually ON while every capture still ran in single-card mode.
+function isBulkMode() {
+  return !!(bulkToggleEl && bulkToggleEl.checked);
+}
+
 const QUEUE = {
   jobs: [],            // { id, frontFile, backFile, thumbUrl, status, result, notes, error }
-  bulk: false,
   active: 0,
   waitingJobId: null,  // single-mode: auto-open this job's result when it lands
   MAX: 3,              // cap concurrent identify calls (cost + load)
@@ -640,12 +712,21 @@ function retryJob(id) {
   pumpQueue();
 }
 
-function discardJob(id) {
+// Single point of removal for a queued job: revokes its thumbnail blob URL,
+// clears the single-mode "waiting" pointer if it referenced this job, and drops
+// it from the queue. Every code path that removes a job goes through here so a
+// blob URL is never left dangling. Does NOT re-render — callers do that.
+function removeJob(id) {
   const job = QUEUE.jobs.find((j) => j.id === id);
   if (!job) return;
   if (job.thumbUrl) URL.revokeObjectURL(job.thumbUrl);
-  QUEUE.jobs = QUEUE.jobs.filter((j) => j.id !== id);
   if (QUEUE.waitingJobId === id) QUEUE.waitingJobId = null;
+  QUEUE.jobs = QUEUE.jobs.filter((j) => j.id !== id);
+}
+
+function discardJob(id) {
+  if (!QUEUE.jobs.some((j) => j.id === id)) return;
+  removeJob(id);
   renderTray();
   updateNavBadge();
 }
@@ -744,12 +825,28 @@ if (scanQueueEl) {
     if (job.status === "ready") reviewJob(job.id);
     else if (job.status === "error") retryJob(job.id);
   });
+
+  // Keyboard activation: the chips are role=button tabindex=0, so Enter/Space
+  // must do what a click does (review if ready / retry if error).
+  scanQueueEl.addEventListener("keydown", (e) => {
+    if (e.key !== "Enter" && e.key !== " " && e.key !== "Spacebar") return;
+    const chip = e.target.closest("[data-job]");
+    if (!chip) return;
+    if (e.key === " " || e.key === "Spacebar") e.preventDefault(); // avoid page scroll
+    const job = QUEUE.jobs.find((j) => j.id === chip.dataset.job);
+    if (!job) return;
+    if (job.status === "ready") reviewJob(job.id);
+    else if (job.status === "error") retryJob(job.id);
+  });
 }
 
 // Single-mode panel shown right after a capture: wait, or move on.
 function showSingleProcessing(job) {
   if (!scanProcessingEl) return;
   QUEUE.waitingJobId = job.id; // auto-open when this one is ready
+  // Announce the Identifying…/ready/error transitions to screen readers.
+  scanProcessingEl.setAttribute("aria-live", "polite");
+  scanProcessingEl.setAttribute("aria-atomic", "true");
   scanProcessingEl.hidden = false;
   scanProcessingEl.innerHTML = `
     <div class="processing-card">
@@ -810,6 +907,9 @@ function resetScanInputs() {
   state.notes = "";
   state.editingResult = false;
   resultNotesEl.value = "";
+  // Drop any preview object URLs so they don't leak across a reset.
+  previewUrls.forEach((u) => URL.revokeObjectURL(u));
+  previewUrls = [];
   renderPreviews();
   captureFrontInput.value = "";
   captureBackInput.value = "";
@@ -851,8 +951,7 @@ function updateNavBadge() {
 
 if (bulkToggleEl) {
   bulkToggleEl.addEventListener("change", () => {
-    QUEUE.bulk = bulkToggleEl.checked;
-    if (QUEUE.bulk) {
+    if (isBulkMode()) {
       hideSingleProcessing();
       if (camSupported() && !cameraStream) startScanCamera();
       else if (cameraStream) setHint("Bulk mode on — tap Capture for each card.");
@@ -1025,7 +1124,7 @@ function renderResult(data) {
   }
   const { identified, valueEstimate } = data;
   const el = document.getElementById("result-card");
-  const highValue = (valueEstimate?.high || 0) >= 250;
+  const highValue = (valueEstimate?.high || 0) >= HIGH_VALUE_THRESHOLD;
   const uncertain = (identified.confidence || 0) < 0.5;
   const inReview = !!state.reviewJobId;
   const moreReady = inReview
@@ -1034,7 +1133,7 @@ function renderResult(data) {
 
   el.innerHTML = `
     ${inReview ? `<div class="review-banner">Reviewing an item from your scan queue.${moreReady ? ` ${moreReady} more ready after this.` : ""} Save it to your collection or discard it.</div>` : ""}
-    ${highValue ? `<div class="high-value-banner">This may be valuable. Get a professional appraisal before selling.</div>` : ""}
+    ${highValue ? `<div class="high-value-banner">This could be worth a closer look — see the Guide before you sell, clean, or grade it.</div>` : ""}
     ${uncertain ? `<div class="uncertain-banner">I'm not very sure about this one. Does it look right? Tap <strong>Edit details</strong> below to fix anything.</div>` : ""}
     ${identifiedSummaryHTML(data)}
     <div class="value-block">
@@ -1204,7 +1303,7 @@ document.getElementById("rescan-btn").addEventListener("click", () => {
 document.getElementById("save-btn").addEventListener("click", async () => {
   if (!state.lastIdentified) return;
   if (!FIREBASE_READY || !currentUser) {
-    alert("Firebase isn't connected yet. Card not saved (demo mode).");
+    showToast("Firebase isn't connected yet. Card not saved (demo mode).", { variant: "info" });
     return;
   }
   const saveBtn = document.getElementById("save-btn");
@@ -1219,17 +1318,16 @@ document.getElementById("save-btn").addEventListener("click", async () => {
       itemType: state.lastIdentified.itemType || "card",
       imageFrontUrl: frontUrl,
       imageBackUrl: backUrl,
-      identified: state.lastIdentified.identified,
-      valueEstimate: state.lastIdentified.valueEstimate,
+      identified: state.lastIdentified.identified || {},
+      valueEstimate: state.lastIdentified.valueEstimate || null,
       ebayPrices: state.lastIdentified.ebayPrices || null,
       userNotes: state.notes || null,
     });
     if (state.reviewJobId) {
-      // Saved a queued card: remove it and step to the next ready one.
-      const saved = QUEUE.jobs.find((j) => j.id === state.reviewJobId);
-      if (saved?.thumbUrl) URL.revokeObjectURL(saved.thumbUrl);
-      QUEUE.jobs = QUEUE.jobs.filter((j) => j.id !== state.reviewJobId);
+      // Saved a queued card: remove it (revoking its blob) and step to the next.
+      const savedId = state.reviewJobId;
       state.reviewJobId = null;
+      removeJob(savedId);
       renderTray();
       updateNavBadge();
       reviewNext();
@@ -1239,7 +1337,7 @@ document.getElementById("save-btn").addEventListener("click", async () => {
     }
   } catch (err) {
     console.error(err);
-    alert("Save failed. Try again.");
+    showToast("Save failed. Try again.", { variant: "error" });
   } finally {
     saveBtn.disabled = false;
     syncResultButtons();
@@ -1276,10 +1374,22 @@ const exportCsvEl = document.getElementById("export-csv");
 let cardsCache = [];
 
 async function renderCollection() {
-  if (IS_DEMO || !currentUser) {
+  if (IS_DEMO) {
     cardsCache = SAMPLE_CARDS.slice();
     locationsCache = [];
     drawCollection();
+    return;
+  }
+  // Production, auth still resolving: show a neutral loading state rather than
+  // flashing the sample cards as if they were the user's own. onAuthStateChanged
+  // calls route() once sign-in completes, which re-renders this view.
+  if (!currentUser) {
+    cardsCache = [];
+    locationsCache = [];
+    collectionListEl.innerHTML = "";
+    collectionTotalEl.textContent = "";
+    collectionEmptyEl.innerHTML = `<p>Loading your collection…</p>`;
+    collectionEmptyEl.hidden = false;
     return;
   }
   await loadLocations();
@@ -1293,11 +1403,18 @@ async function renderCollection() {
 const sortComparators = {
   newest: (a, b) => tsMs(b.createdAt) - tsMs(a.createdAt),
   oldest: (a, b) => tsMs(a.createdAt) - tsMs(b.createdAt),
-  "highest-value": (a, b) => (b.valueEstimate?.high || 0) - (a.valueEstimate?.high || 0),
-  "lowest-value": (a, b) => (a.valueEstimate?.low || 0) - (b.valueEstimate?.low || 0),
+  // Sort by the HIGH end of the value range (the optimistic estimate).
+  "high-desc": (a, b) => (b.valueEstimate?.high || 0) - (a.valueEstimate?.high || 0),
+  "high-asc": (a, b) => (a.valueEstimate?.high || 0) - (b.valueEstimate?.high || 0),
+  // Sort by the LOW end of the value range (the conservative estimate).
+  "low-desc": (a, b) => (b.valueEstimate?.low || 0) - (a.valueEstimate?.low || 0),
+  "low-asc": (a, b) => (a.valueEstimate?.low || 0) - (b.valueEstimate?.low || 0),
   "newest-cards": (a, b) => (b.identified?.year || 0) - (a.identified?.year || 0),
   "oldest-cards": (a, b) => (a.identified?.year || 9999) - (b.identified?.year || 9999),
-  "player-az": (a, b) => (a.identified?.player || "").localeCompare(b.identified?.player || ""),
+  "player-az": (a, b) =>
+    (a.identified?.player || a.identified?.itemLabel || "").localeCompare(
+      b.identified?.player || b.identified?.itemLabel || "",
+    ),
 };
 
 function applyFiltersAndSort(cards) {
@@ -1491,9 +1608,13 @@ sortSelectEl.addEventListener("change", () => {
   drawCollection();
 });
 
+// a11y: announce the collapsed/expanded state of the filters panel.
+filtersToggleEl.setAttribute("aria-controls", "filters-panel");
+filtersToggleEl.setAttribute("aria-expanded", "false");
 filtersToggleEl.addEventListener("click", () => {
   filtersPanelEl.hidden = !filtersPanelEl.hidden;
   filtersToggleEl.classList.toggle("active", !filtersPanelEl.hidden);
+  filtersToggleEl.setAttribute("aria-expanded", String(!filtersPanelEl.hidden));
 });
 
 filterSportEl.addEventListener("change", () => {
@@ -1535,7 +1656,7 @@ filtersClearEl.addEventListener("click", clearAllFilters);
 exportCsvEl.addEventListener("click", () => {
   const filtered = applyFiltersAndSort(cardsCache);
   if (filtered.length === 0) {
-    alert("Nothing to export. Try clearing your filters.");
+    showToast("Nothing to export. Try clearing your filters.", { variant: "info" });
     return;
   }
   exportCSV(filtered);
@@ -1641,12 +1762,12 @@ async function renderDetail(cardId) {
 
 function renderDetailDisplay(el) {
   const c = detailState.card;
-  const highValue = (c.valueEstimate?.high || 0) >= 250;
+  const highValue = (c.valueEstimate?.high || 0) >= HIGH_VALUE_THRESHOLD;
   const uncertain = (c.identified?.confidence || 0) < 0.5 && !c.identified?.userEdited;
 
   el.innerHTML = `
     ${IS_DEMO ? `<div class="demo-banner">This is a <strong>sample item</strong>. Editing and deleting are disabled in demo mode.</div>` : ""}
-    ${highValue ? `<div class="high-value-banner">This may be valuable. Get a professional appraisal before selling.</div>` : ""}
+    ${highValue ? `<div class="high-value-banner">This could be worth a closer look — see the Guide before you sell, clean, or grade it.</div>` : ""}
     ${uncertain ? `<div class="uncertain-banner">The AI wasn't very sure about this one. Tap <strong>Edit details</strong> to correct anything.</div>` : ""}
     <div class="result-card">
       ${identifiedSummaryHTML(c)}
@@ -1658,7 +1779,7 @@ function renderDetailDisplay(el) {
       ${renderEbayBlock(c.ebayPrices)}
       ${renderPriceLinks(c)}
     </div>
-    ${c.locationId && locationName(c.locationId) ? `<div class="location-display">📍 <strong>Location:</strong> ${esc(locationName(c.locationId))}</div>` : ""}
+    ${c.locationId && locationName(c.locationId) ? `<div class="location-display"><span aria-hidden="true">📍</span> <strong>Location:</strong> ${esc(locationName(c.locationId))}</div>` : ""}
     ${c.userNotes ? `<div class="notes-display">${esc(c.userNotes)}</div>` : ""}
     ${ebaySectionHTML(c)}
     ${IS_DEMO ? "" : `<div class="row"><button id="detail-edit-btn" class="big-button">Edit details &amp; notes</button></div>`}
@@ -1673,7 +1794,7 @@ function renderDetailDisplay(el) {
       renderDetail(detailState.cardId);
     });
     document.getElementById("delete-btn").addEventListener("click", async () => {
-      if (!confirm("Remove this card from your collection?")) return;
+      if (!(await confirmDialog({ title: "Remove this card?", message: "This removes it from your collection.", confirmLabel: "Remove", cancelLabel: "Keep it", danger: true }))) return;
       try {
         await deleteDoc(doc(db, "users", currentUser.uid, "cards", detailState.cardId));
         detailState.cardId = null;
@@ -1682,10 +1803,13 @@ function renderDetailDisplay(el) {
         location.hash = "#/collection";
       } catch (err) {
         console.error(err);
-        alert("Couldn't remove. Try again.");
+        showToast("Couldn't remove. Try again.", { variant: "error" });
       }
     });
   }
+
+  // a11y: the detail view has no static <h2>, so focus the rendered headline.
+  focusHeadingEl(el.querySelector(".player"));
 }
 
 function renderDetailEditing(el) {
@@ -1721,10 +1845,10 @@ function renderDetailEditing(el) {
   // leaving the page or losing the other edits in this form.
   document.getElementById("detail-new-location").addEventListener("click", async () => {
     if (IS_DEMO || !currentUser) {
-      alert("Sign in to add locations.");
+      showToast("Sign in to add locations.", { variant: "error" });
       return;
     }
-    const raw = prompt('New location name (e.g. "Binder A — Page 3")');
+    const raw = await promptDialog({ title: "New location", label: 'Location name (e.g. "Binder A — Page 3")', placeholder: "Binder A — Page 3", confirmLabel: "Add" });
     if (raw == null) return;
     const name = raw.trim();
     if (!name) return;
@@ -1743,7 +1867,7 @@ function renderDetailEditing(el) {
       sel.value = id;
     } catch (err) {
       console.error(err);
-      alert("Couldn't add that location. Try again.");
+      showToast("Couldn't add that location. Try again.", { variant: "error" });
     }
   });
 
@@ -1765,7 +1889,7 @@ function renderDetailEditing(el) {
       renderDetail(detailState.cardId);
     } catch (err) {
       console.error(err);
-      alert("Couldn't save changes. Try again.");
+      showToast("Couldn't save changes. Try again.", { variant: "error" });
       applyBtn.disabled = false;
       applyBtn.textContent = "Save changes";
     }
@@ -1774,10 +1898,16 @@ function renderDetailEditing(el) {
     detailState.editing = false;
     renderDetail(detailState.cardId);
   });
+
+  // a11y: focus the edit form's heading after it renders.
+  focusHeadingEl(el.querySelector(".edit-title"));
 }
 
 document.getElementById("back-btn").addEventListener("click", () => {
-  history.back();
+  // history.back() dead-ends on a deep-linked entry (no prior in-app history);
+  // fall back to the collection in that case.
+  if (history.length > 1) history.back();
+  else location.hash = "#/collection";
 });
 
 // --- Locations -------------------------------------------------------------
@@ -1816,15 +1946,24 @@ async function renderLocations() {
   await loadLocations();
 
   // Count how many cards sit in each location so the list doubles as a map.
+  // Reuse the already-loaded collection cache when available; only hit Firestore
+  // when we have nothing cached (avoids a redundant full read of every card).
   const counts = {};
-  try {
-    const snap = await getDocs(collection(db, "users", currentUser.uid, "cards"));
-    snap.docs.forEach((d) => {
-      const lid = d.data().locationId;
+  if (cardsCache.length > 0) {
+    cardsCache.forEach((c) => {
+      const lid = c.locationId;
       if (lid) counts[lid] = (counts[lid] || 0) + 1;
     });
-  } catch (err) {
-    console.warn("Couldn't count cards per location", err);
+  } else {
+    try {
+      const snap = await getDocs(collection(db, "users", currentUser.uid, "cards"));
+      snap.docs.forEach((d) => {
+        const lid = d.data().locationId;
+        if (lid) counts[lid] = (counts[lid] || 0) + 1;
+      });
+    } catch (err) {
+      console.warn("Couldn't count cards per location", err);
+    }
   }
 
   if (locationsCache.length === 0) {
@@ -1859,7 +1998,7 @@ if (locationAddForm) {
     const name = locationAddInput.value.trim();
     if (!name) return;
     if (IS_DEMO || !currentUser) {
-      alert("Sign in to add locations.");
+      showToast("Sign in to add locations.", { variant: "error" });
       return;
     }
     try {
@@ -1872,7 +2011,7 @@ if (locationAddForm) {
       await renderLocations();
     } catch (err) {
       console.error(err);
-      alert("Couldn't add that location. Try again.");
+      showToast("Couldn't add that location. Try again.", { variant: "error" });
     }
   });
 }
@@ -1887,7 +2026,7 @@ if (locationsListEl) {
     const loc = locationsCache.find((l) => l.id === id);
 
     if (btn.dataset.act === "rename") {
-      const next = prompt("Rename location", loc ? loc.name : "");
+      const next = await promptDialog({ title: "Rename location", label: "Location name", value: loc ? loc.name : "", confirmLabel: "Save" });
       if (next == null) return;
       const name = next.trim();
       if (!name) return;
@@ -1896,17 +2035,17 @@ if (locationsListEl) {
         await renderLocations();
       } catch (err) {
         console.error(err);
-        alert("Couldn't rename. Try again.");
+        showToast("Couldn't rename. Try again.", { variant: "error" });
       }
     } else if (btn.dataset.act === "delete") {
       const label = loc ? loc.name : "this location";
-      if (!confirm(`Delete “${label}”? Cards assigned to it will become unassigned.`)) return;
+      if (!(await confirmDialog({ title: `Delete "${label}"?`, message: "Cards assigned to it will become unassigned.", confirmLabel: "Delete", cancelLabel: "Cancel", danger: true }))) return;
       try {
         await deleteDoc(doc(db, "users", currentUser.uid, "locations", id));
         await renderLocations();
       } catch (err) {
         console.error(err);
-        alert("Couldn't delete. Try again.");
+        showToast("Couldn't delete. Try again.", { variant: "error" });
       }
     }
   });
@@ -1929,6 +2068,197 @@ function populateLocationFilter() {
     locationsCache.some((l) => l.id === current);
   collectionFilters.location = stillValid ? current : "all";
   filterLocationEl.value = collectionFilters.location;
+}
+
+// --- In-app dialogs (replaces native alert/confirm/prompt) -----------------
+// Native dialogs are jarring on phones, can't be styled to match the app, and
+// some mobile browsers suppress them. These accessible equivalents build their
+// own DOM (appended to <body>), so no extra HTML is needed in index.html.
+
+// Non-blocking toast. opts.variant: "error" | "info" | "success" (default info).
+function showToast(message, opts = {}) {
+  const variant = opts.variant || "info";
+  let container = document.getElementById("cv-toasts");
+  if (!container) {
+    container = document.createElement("div");
+    container.id = "cv-toasts";
+    container.className = "cv-toasts";
+    container.setAttribute("role", "status");
+    container.setAttribute("aria-live", "polite");
+    container.setAttribute("aria-atomic", "true");
+    document.body.appendChild(container);
+  }
+  const toast = document.createElement("div");
+  toast.className = `cv-toast cv-toast-${variant}`;
+  toast.textContent = String(message ?? "");
+
+  let removed = false;
+  let timer = null;
+  function dismiss() {
+    if (removed) return;
+    removed = true;
+    if (timer) clearTimeout(timer);
+    toast.classList.add("cv-toast-leaving");
+    // Remove after the short fade-out (neutralized under prefers-reduced-motion).
+    setTimeout(() => toast.remove(), 200);
+  }
+  toast.addEventListener("click", dismiss);
+  container.appendChild(toast);
+  // Trigger the enter transition on the next frame.
+  requestAnimationFrame(() => toast.classList.add("cv-toast-in"));
+  timer = setTimeout(dismiss, 4000);
+  return toast;
+}
+
+// Shared modal scaffolding for confirmDialog / promptDialog. Returns the pieces
+// each needs and centralizes focus trapping, Escape/backdrop dismissal, and
+// focus restore. `buildBody(dialog)` adds the dialog's inner content and must
+// return the element to focus first. `onClose(result)` resolves the promise.
+function openModal({ labelledBy, describedBy, buildBody, getFocusables, onClose }) {
+  const previouslyFocused = document.activeElement;
+  const backdrop = document.createElement("div");
+  backdrop.className = "cv-modal-backdrop";
+
+  const dialog = document.createElement("div");
+  dialog.className = "cv-modal";
+  dialog.setAttribute("role", "dialog");
+  dialog.setAttribute("aria-modal", "true");
+  if (labelledBy) dialog.setAttribute("aria-labelledby", labelledBy);
+  if (describedBy) dialog.setAttribute("aria-describedby", describedBy);
+  backdrop.appendChild(dialog);
+
+  let closed = false;
+  function close(result) {
+    if (closed) return;
+    closed = true;
+    document.removeEventListener("keydown", onKeydown, true);
+    backdrop.remove();
+    // Restore focus to wherever the user was before the dialog opened.
+    if (previouslyFocused && typeof previouslyFocused.focus === "function") {
+      try { previouslyFocused.focus(); } catch (_) { /* element may be gone */ }
+    }
+    onClose(result);
+  }
+
+  function onKeydown(e) {
+    if (e.key === "Escape") {
+      e.preventDefault();
+      close(undefined); // caller maps undefined → cancel value
+      return;
+    }
+    if (e.key === "Tab") {
+      const focusables = getFocusables(dialog).filter((el) => el && !el.disabled);
+      if (!focusables.length) return;
+      const first = focusables[0];
+      const last = focusables[focusables.length - 1];
+      const active = document.activeElement;
+      if (e.shiftKey) {
+        if (active === first || !dialog.contains(active)) {
+          e.preventDefault();
+          last.focus();
+        }
+      } else if (active === last) {
+        e.preventDefault();
+        first.focus();
+      }
+    }
+  }
+
+  backdrop.addEventListener("mousedown", (e) => {
+    // Backdrop click cancels — only when the click started on the backdrop
+    // itself (not on the dialog, which would catch text-selection drags).
+    if (e.target === backdrop) close(undefined);
+  });
+
+  const focusTarget = buildBody(dialog, close);
+  document.body.appendChild(backdrop);
+  document.addEventListener("keydown", onKeydown, true);
+  // Move focus into the dialog after it's in the DOM.
+  if (focusTarget && typeof focusTarget.focus === "function") {
+    try { focusTarget.focus(); } catch (_) { /* noop */ }
+  }
+  return close;
+}
+
+// Promise<boolean>. Resolves true on confirm; false on cancel/backdrop/Escape.
+function confirmDialog(opts = {}) {
+  const {
+    title = "",
+    message = "",
+    confirmLabel = "OK",
+    cancelLabel = "Cancel",
+    danger = false,
+  } = opts;
+  return new Promise((resolve) => {
+    const titleId = "cv-modal-title";
+    const msgId = "cv-modal-desc";
+    openModal({
+      labelledBy: title ? titleId : null,
+      describedBy: message ? msgId : null,
+      getFocusables: (dialog) => Array.from(dialog.querySelectorAll("button")),
+      onClose: (result) => resolve(result === true),
+      buildBody: (dialog, close) => {
+        dialog.innerHTML = `
+          ${title ? `<h2 class="cv-modal-title" id="${titleId}">${esc(title)}</h2>` : ""}
+          ${message ? `<p class="cv-modal-message" id="${msgId}">${esc(message)}</p>` : ""}
+          <div class="cv-modal-actions">
+            <button type="button" class="big-button cv-modal-cancel">${esc(cancelLabel)}</button>
+            <button type="button" class="big-button primary cv-modal-confirm${danger ? " danger" : ""}">${esc(confirmLabel)}</button>
+          </div>
+        `;
+        dialog.querySelector(".cv-modal-cancel").addEventListener("click", () => close(false));
+        dialog.querySelector(".cv-modal-confirm").addEventListener("click", () => close(true));
+        return dialog.querySelector(".cv-modal-confirm");
+      },
+    });
+  });
+}
+
+// Promise<string|null>. Resolves the raw input value on Save (callers .trim()
+// as needed); null on cancel/backdrop/Escape.
+function promptDialog(opts = {}) {
+  const {
+    title = "",
+    label = "",
+    value = "",
+    placeholder = "",
+    confirmLabel = "Save",
+  } = opts;
+  return new Promise((resolve) => {
+    const titleId = "cv-modal-title";
+    const labelId = "cv-modal-label";
+    const inputId = "cv-modal-input";
+    openModal({
+      labelledBy: title ? titleId : null,
+      describedBy: label ? labelId : null,
+      getFocusables: (dialog) =>
+        Array.from(dialog.querySelectorAll("input, button")),
+      onClose: (result) => resolve(typeof result === "string" ? result : null),
+      buildBody: (dialog, close) => {
+        dialog.innerHTML = `
+          ${title ? `<h2 class="cv-modal-title" id="${titleId}">${esc(title)}</h2>` : ""}
+          <label class="cv-modal-field" for="${inputId}">
+            ${label ? `<span id="${labelId}">${esc(label)}</span>` : ""}
+            <input id="${inputId}" type="text" value="${esc(value)}" placeholder="${esc(placeholder)}" autocomplete="off" />
+          </label>
+          <div class="cv-modal-actions">
+            <button type="button" class="big-button cv-modal-cancel">Cancel</button>
+            <button type="button" class="big-button primary cv-modal-confirm">${esc(confirmLabel)}</button>
+          </div>
+        `;
+        const input = dialog.querySelector("#" + inputId);
+        dialog.querySelector(".cv-modal-cancel").addEventListener("click", () => close(null));
+        dialog.querySelector(".cv-modal-confirm").addEventListener("click", () => close(input.value));
+        input.addEventListener("keydown", (e) => {
+          if (e.key === "Enter") {
+            e.preventDefault();
+            close(input.value);
+          }
+        });
+        return input;
+      },
+    });
+  });
 }
 
 // --- Helpers ---------------------------------------------------------------
@@ -2135,7 +2465,7 @@ function ebaySectionHTML(c) {
           </div>
           <textarea id="ebay-desc-${slug}">${esc(desc)}</textarea>
           <div class="ebay-ai-row">
-            <button type="button" class="control-btn ai-listing-btn" data-ai-slug="${slug}" data-ai-target="#ebay-desc-${slug}">✦ Write a better description with AI</button>
+            <button type="button" class="control-btn ai-listing-btn" data-ai-slug="${slug}" data-ai-target="#ebay-desc-${slug}"><span aria-hidden="true">✦</span> Write a better description with AI</button>
             <span class="ai-listing-status" id="ai-listing-status-${slug}" aria-live="polite"></span>
           </div>
           <p class="ebay-ai-hint muted">Researches the item online and writes a professional, sales-focused description. Edit it after.</p>
@@ -2268,20 +2598,43 @@ route();
 if ("serviceWorker" in navigator) {
   window.addEventListener("load", async () => {
     try {
+      // Only auto-reload on update if a controller already existed at load time.
+      // A first-ever install has no controller, so it must never trigger a reload.
+      const hadController = !!navigator.serviceWorker.controller;
       const registration = await navigator.serviceWorker.register("sw.js");
 
-      // When a new SW takes over, reload so the live page runs against fresh
-      // assets. skipWaiting() in sw.js means the new SW activates immediately
-      // after install, so this fires shortly after a deploy is detected.
-      registration.addEventListener("updatefound", () => {
-        const newSW = registration.installing;
-        if (!newSW) return;
-        newSW.addEventListener("statechange", () => {
-          if (newSW.state === "activated" && navigator.serviceWorker.controller) {
+      // It's only SAFE to hard-reload when there's no in-flight or unsaved work:
+      // the scan QUEUE is empty, there's no pending identified result, and the
+      // user isn't sitting on the result view. Otherwise a reload would wipe the
+      // in-memory queue / unsaved capture.
+      function reloadIsSafe() {
+        return (
+          QUEUE.jobs.length === 0 &&
+          !state.lastIdentified &&
+          !(location.hash || "").startsWith("#/result")
+        );
+      }
+
+      function notifyUpdatePending() {
+        // Non-blocking notice — let the user finish, then refresh on their terms.
+        if (scanStatus) {
+          scanStatus.textContent = "An update is ready — refresh when you're done.";
+        }
+      }
+
+      // Guard against the double-reload that controllerchange can otherwise cause.
+      let refreshing = false;
+      if (hadController) {
+        navigator.serviceWorker.addEventListener("controllerchange", () => {
+          if (refreshing) return;
+          if (reloadIsSafe()) {
+            refreshing = true;
             window.location.reload();
+          } else {
+            notifyUpdatePending();
           }
         });
-      });
+      }
 
       // Poll every 60 seconds so a long-open tab eventually catches deploys.
       setInterval(() => registration.update().catch(() => {}), 60_000);

@@ -8,7 +8,7 @@
 // Bump CACHE on breaking changes — the activate handler wipes everything
 // else.
 
-const CACHE = "card-vault-v3";
+const CACHE = "card-vault-v4";
 
 // Precache the app shell so a first-time offline visit still works.
 const SHELL_ASSETS = ["./", "index.html", "app.css", "app.js", "manifest.json"];
@@ -34,6 +34,16 @@ self.addEventListener("activate", (event) => {
   self.clients.claim();
 });
 
+// Only cache static assets we recognize. SPA deep-link URLs (handled by the
+// hosting rewrite) all return the same index.html, so caching them under their
+// own URL would bloat the cache with duplicate shell copies.
+const STATIC_EXT = /\.(?:js|css|json|png)$/i;
+
+function isStaticAsset(url) {
+  const path = url.pathname.replace(/^\//, "");
+  return SHELL_ASSETS.includes(path) || SHELL_ASSETS.includes("./" + path) || STATIC_EXT.test(url.pathname);
+}
+
 self.addEventListener("fetch", (event) => {
   const req = event.request;
   if (req.method !== "GET") return;
@@ -43,16 +53,32 @@ self.addEventListener("fetch", (event) => {
   // Fonts, Anthropic via the function) passes straight through.
   if (url.origin !== location.origin) return;
 
+  const isNavigate = req.mode === "navigate";
+
   // Network-first: always try fresh, fall back to cache for offline.
   event.respondWith(
     fetch(req)
       .then((response) => {
-        if (response && response.status === 200) {
-          const clone = response.clone();
-          caches.open(CACHE).then((c) => c.put(req, clone)).catch(() => {});
+        // Only cache clean, basic (same-origin, non-redirected) 200s. Redirects
+        // and opaque responses are never stored.
+        const cacheable =
+          response &&
+          response.status === 200 &&
+          !response.redirected &&
+          response.type === "basic";
+        if (cacheable) {
+          if (isNavigate) {
+            // Store every navigation (SPA deep links → rewritten index.html)
+            // under one canonical key so the cache holds a single shell copy.
+            const clone = response.clone();
+            caches.open(CACHE).then((c) => c.put(new Request("./"), clone)).catch(() => {});
+          } else if (isStaticAsset(url)) {
+            const clone = response.clone();
+            caches.open(CACHE).then((c) => c.put(req, clone)).catch(() => {});
+          }
         }
         return response;
       })
-      .catch(() => caches.match(req)),
+      .catch(() => (isNavigate ? caches.match("./") : caches.match(req))),
   );
 });
