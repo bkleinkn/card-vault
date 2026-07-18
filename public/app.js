@@ -607,9 +607,16 @@ async function startScanCamera() {
     showCameraFallback("This browser can't open the camera here. Upload a photo instead.");
     return;
   }
-  if (cameraStream) {                 // already running
-    captureNowBtn.hidden = false;
-    return;
+  if (cameraStream) {
+    // Already running — but only trust it if the track is actually live. The OS
+    // can end a camera track out from under us (another app grabs the camera,
+    // power saving); a dead stream yields 2x2 placeholder frames, not photos.
+    const track = cameraStream.getVideoTracks()[0];
+    if (track && track.readyState === "live") {
+      captureNowBtn.hidden = false;
+      return;
+    }
+    stopScanCamera();                 // dead — tear down and reopen below
   }
   enableCameraBtn.hidden = true;
   try {
