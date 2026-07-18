@@ -16,7 +16,7 @@ If a feature requires collector jargon to use, it doesn't belong in v1.
 
 - **Frontend:** Vanilla HTML/CSS/JS PWA (no framework). Matches the rest of the SVL portfolio (Challenge, PinPoint, Card-on-File, Capital City Matchgames).
 - **Hosting:** Firebase Hosting
-- **Auth:** Firebase Anonymous Auth (frictionless for older users; upgradeable to email later)
+- **Auth:** Firebase Anonymous Auth by default (frictionless for older users), upgradeable in-app to a shared email+password **family login** (`#/account`) so multiple phones can share one collection. Requires the Email/Password provider enabled in Firebase Console → Authentication → Sign-in method.
 - **Database:** Firestore
 - **Image storage:** Firebase Cloud Storage
 - **AI vision:** Claude Opus 4.8 via the Anthropic SDK (called from a Cloud Function so the key never ships to the client). Adaptive thinking + `output_config.format` json_schema for guaranteed structured output + ephemeral prompt caching on `IDENTIFY_PROMPT` (~90% cost reduction after the first scan).
@@ -140,6 +140,10 @@ The collection view shows only **kept** cards (`status:"kept"` or missing); pend
 
 **Inline locations.** The card detail edit form has a "+ New" button next to the Location select that creates a storage location (writes `users/{uid}/locations/{id}`) and assigns it without leaving the page.
 
+**Front + back in one capture.** The live camera is a guided two-shot: capture the front, then the same shutter becomes "Capture back" (corner thumbnail shows the captured front; a "Skip — save front only" button queues front-only). The pair travels as one queue job → one card, in both single and Bulk mode; closing the camera mid-pair queues the front alone so nothing is lost. Both images go to `identifyCard` and are stored as `imageFrontUrl` / `imageBackUrl`.
+
+**Family login (shared collection).** Every device starts on its own invisible anonymous account. The top-bar user chip (reads "Set up sharing" while anonymous) links to `#/account`, where **creating** the family login runs `linkWithCredential` on the current anonymous user — same uid, so the phone that already holds the collection keeps every card — and the other phones simply **sign in** with the shared email+password to see the same collection. Signing in on a phone whose own account has cards warns first (count via `getCountFromServer`); sign-out drops the device back to a fresh anonymous account. Startup no longer calls `signInAnonymously` unconditionally — it waits for the first auth state so a restoring family session isn't replaced by a new anonymous one.
+
 ## File layout
 
 ```
@@ -188,7 +192,9 @@ card-vault/
 
 **Phase 6 (durable review pool + sharing) — CODE DONE, NEEDS DEPLOY.** Durable pending-review pool: scans persist to Firestore as `status:"pending"` the moment they're identified, so nothing is lost on reload / external link / device switch; the "Needs review" view (`#/review`) handles Keep vs Discard and the collection shows only kept cards. Bulk mode auto-applies a batch location to every card. Public view-only share link: `createShareLink` / `revokeShareLink` (auth'd) + `getSharedCollection` (PUBLIC) back a `shares/{token}` → uid map (Admin-only in rules), surfaced as a `#/share/{token}` read-only gallery with dollar values, notes, and locations stripped. **To go live:** `firebase deploy --only functions --project=card-vault-d8fa4` (createShareLink / revokeShareLink / getSharedCollection + onCardDeleted), `firebase deploy --only firestore:rules --project=card-vault-d8fa4` (shares collection lockdown), **and** `firebase deploy --only hosting --project=card-vault-d8fa4`.
 
-**Phase 7+ (deferred features)** — real pricing data, condition grading, selling assistance, custom domain, etc.
+**Phase 7 (front+back capture + family login) — CODE DONE, NEEDS DEPLOY.** Guided front→back two-shot camera flow (skippable back, one queue job per item) and the `#/account` family-login view (create-by-linking / sign-in / password reset / sign-out) for sharing one collection across phones; About page rewritten to point multi-phone users at the family login. Client-only change. **To go live:** enable the **Email/Password** sign-in provider in Firebase Console → Authentication → Sign-in method (one-time; until then creating the family login fails with `auth/operation-not-allowed`, surfaced with a plain-English message), then `firebase deploy --only hosting --project=card-vault-d8fa4`. No function changes.
+
+**Phase 8+ (deferred features)** — real pricing data, condition grading, selling assistance, custom domain, etc.
 
 ## Operational notes
 

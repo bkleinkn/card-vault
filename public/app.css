@@ -2200,6 +2200,83 @@ body.viewing-share { padding-bottom: 28px; }
   .bulk-location .location-pick { flex-wrap: wrap; }
 }
 
+/* ---------- Front-then-back capture ----------
+   After the front is captured, a small confirmation thumbnail pins to the
+   corner of the live camera while the hint asks for the back of the card. */
+.camera-front-thumb {
+  position: absolute;
+  top: 10px;
+  left: 10px;
+  width: 62px;
+  border-radius: 8px;
+  border: 2px solid var(--accent);
+  box-shadow: 0 4px 14px rgba(2, 6, 23, 0.6);
+  z-index: 3;
+}
+
+#skip-back-btn {
+  margin-top: 8px;
+}
+
+/* ---------- Account / family login ---------- */
+a.user-chip {
+  text-decoration: none;
+  max-width: 190px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  transition: color 0.15s ease, border-color 0.15s ease;
+}
+
+a.user-chip:hover {
+  color: var(--ink);
+  border-color: var(--accent);
+}
+
+.account-box {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 18px;
+  margin-top: 8px;
+}
+
+.account-box p {
+  margin: 0;
+}
+
+.account-box h3 {
+  margin: 10px 0 0;
+}
+
+.account-form {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.account-form label {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--ink-2);
+  margin-top: 6px;
+}
+
+.account-create {
+  border-top: 1px solid var(--border);
+  padding-top: 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.status.error {
+  color: var(--rose);
+}
+
 /* ---------- Reduced motion (a11y) ----------
    Honor the OS "reduce motion" setting: kill continuous/looping animation
    and collapse long transitions. Older users who get motion sick or find

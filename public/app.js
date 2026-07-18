@@ -9,6 +9,11 @@ import {
   getAuth,
   signInAnonymously,
   onAuthStateChanged,
+  EmailAuthProvider,
+  linkWithCredential,
+  signInWithEmailAndPassword,
+  sendPasswordResetEmail,
+  signOut,
 } from "https://www.gstatic.com/firebasejs/10.13.2/firebase-auth.js";
 import {
   getFirestore,
@@ -23,6 +28,7 @@ import {
   where,
   orderBy,
   serverTimestamp,
+  getCountFromServer,
 } from "https://www.gstatic.com/firebasejs/10.13.2/firebase-firestore.js";
 import {
   getStorage,
@@ -62,22 +68,66 @@ if (FIREBASE_READY) {
   storage = getStorage(app);
   functions = getFunctions(app, "us-central1");
 
+  // Whether the FIRST auth state has resolved. Anonymous sign-in must only run
+  // when that initial state is "nobody" — calling signInAnonymously while a
+  // family (email) session is restoring would replace it with a fresh anonymous
+  // account and "lose" the shared collection on every app open.
+  let authInitialized = false;
+  let lastUid = null;
+
   onAuthStateChanged(auth, (user) => {
     currentUser = user;
-    document.getElementById("user-chip").textContent = user ? "Signed in" : "";
+    // Switched accounts (family sign-in, or sign-out back to a device-local
+    // account): every per-user cache is now someone else's data.
+    if (user && lastUid && user.uid !== lastUid) {
+      cardsCache = [];
+      locationsCache = [];
+    }
+    if (user) lastUid = user.uid;
+    updateUserChip();
+    if (!authInitialized) {
+      authInitialized = true;
+      if (!user) {
+        // First run on this device: frictionless invisible account.
+        signInAnonymously(auth).catch((err) => {
+          console.error("Anonymous sign-in failed", err);
+          updateUserChip("Offline");
+        });
+      }
+    }
     // Re-render whatever view is active (detail, locations, collection) now that
     // currentUser is known — fixes the detail view dead-ending on "Signing in…".
     route();
     // Populate the review-pool count / badges / banners now that we can query.
     refreshPendingCount();
   });
-
-  signInAnonymously(auth).catch((err) => {
-    console.error("Anonymous sign-in failed", err);
-    document.getElementById("user-chip").textContent = "Offline";
-  });
 } else {
-  document.getElementById("user-chip").textContent = "Demo mode";
+  updateUserChip();
+}
+
+// Top-bar chip: doubles as the way into the family-login screen, so its text
+// invites setup while the device is still on its private anonymous account.
+function updateUserChip(override) {
+  const chip = document.getElementById("user-chip");
+  if (!chip) return;
+  if (override) {
+    chip.textContent = override;
+    return;
+  }
+  if (!FIREBASE_READY) {
+    chip.textContent = "Demo mode";
+    return;
+  }
+  if (!currentUser) {
+    chip.textContent = "Signing in…";
+    return;
+  }
+  chip.textContent = currentUser.isAnonymous
+    ? "Set up sharing"
+    : currentUser.email || "Signed in";
+  chip.title = currentUser.isAnonymous
+    ? "This phone keeps its own collection — tap to set up the shared family login"
+    : `Signed in as ${currentUser.email || "the family login"} — tap to manage`;
 }
 
 // IS_DEMO is true only when Firebase isn't configured. In production
@@ -366,6 +416,9 @@ function route() {
   } else if (hash.startsWith("#/locations")) {
     showView("locations");
     renderLocations();
+  } else if (hash.startsWith("#/account")) {
+    showView("account");
+    renderAccount();
   } else if (hash.startsWith("#/about")) {
     showView("about");
   } else if (hash.startsWith("#/guide")) {
@@ -419,9 +472,10 @@ document.querySelectorAll(".itemtype-btn").forEach((btn) => {
     document.querySelectorAll(".itemtype-btn").forEach((b) => {
       b.classList.toggle("active", b === btn);
     });
-    // Update the live-camera hint if the camera is already open.
-    if (cameraStream) {
-      setHint(`Scanning a ${itemNoun(state.itemType)} — fill the frame, then tap Capture.`);
+    // Update the live-camera hint if the camera is already open — unless we're
+    // mid-pair waiting on a back photo, where the hint must keep asking for it.
+    if (cameraStream && !pendingFront) {
+      setHint(`Scanning a ${itemNoun(state.itemType)} — capture the front to start.`);
     }
   });
 });
@@ -498,11 +552,15 @@ const cameraStage = document.getElementById("camera-stage");
 const cameraVideo = document.getElementById("camera-video");
 const cameraHint = document.getElementById("camera-hint");
 const captureNowBtn = document.getElementById("capture-now-btn");
+const skipBackBtn = document.getElementById("skip-back-btn");
+const cameraFrontThumb = document.getElementById("camera-front-thumb");
 const enableCameraBtn = document.getElementById("enable-camera-btn");
 const cameraFallback = document.getElementById("camera-fallback");
 
 let cameraStream = null;
 let capturing = false;          // guards against double-capture mid-identify
+let pendingFront = null;        // captured front File waiting for its back photo
+let pendingFrontUrl = null;     // object URL behind the corner thumbnail
 
 function camSupported() {
   return !!(navigator.mediaDevices && navigator.mediaDevices.getUserMedia);
@@ -573,18 +631,26 @@ async function startScanCamera() {
   }
   cameraVideo.srcObject = cameraStream;
   try { await cameraVideo.play(); } catch (_) { /* autoplay attribute usually covers it */ }
+  exitBackStep();                     // a fresh camera always starts on the front
   cameraStage.hidden = false;
   captureNowBtn.hidden = false;
   cameraFallback.hidden = false;      // keep the escape hatch reachable, collapsed
   scanStatus.textContent = "";
   setHint(
     isBulkMode()
-      ? "Bulk mode — tap Capture for each card, one after another."
-      : "Fill the frame with the card, then tap Capture",
+      ? `Bulk mode — capture the front of the first ${itemNoun(state.itemType)}.`
+      : `Fill the frame with the front of the ${itemNoun(state.itemType)}, then tap Capture`,
   );
 }
 
 function stopScanCamera() {
+  // Camera closing mid back-step (tab hidden, navigation away): don't lose the
+  // captured front — queue it front-only, since the back can't be taken now.
+  if (pendingFront) {
+    const front = pendingFront;
+    exitBackStep();
+    enqueueScan(front);
+  }
   if (cameraStream) {
     cameraStream.getTracks().forEach((t) => t.stop());
     cameraStream = null;
@@ -592,9 +658,10 @@ function stopScanCamera() {
   cameraVideo.srcObject = null;
   cameraStage.hidden = true;
   captureNowBtn.hidden = true;
+  skipBackBtn.hidden = true;
 }
 
-async function captureFrameFile() {
+async function captureFrameFile(name) {
   const vw = cameraVideo.videoWidth, vh = cameraVideo.videoHeight;
   const maxDim = 1600;
   const scale = Math.min(1, maxDim / Math.max(vw, vh));
@@ -604,25 +671,42 @@ async function captureFrameFile() {
   c.height = h;
   c.getContext("2d").drawImage(cameraVideo, 0, 0, w, h);
   const blob = await new Promise((res) => c.toBlob(res, "image/jpeg", 0.9));
-  return new File([blob], "front.jpg", { type: "image/jpeg" });
+  return new File([blob], name, { type: "image/jpeg" });
 }
 
+// Two-step capture: the first shutter press grabs the FRONT, then the same
+// button grabs the BACK of the same item (or "Skip" queues it front-only).
+// Both photos travel together in one job → one card.
 async function captureAndIdentify() {
   if (capturing || !cameraStream) return;
   capturing = true;
-  setHint("Got it!");
   let file;
   try {
-    file = await captureFrameFile();
+    file = await captureFrameFile(pendingFront ? "back.jpg" : "front.jpg");
   } catch (err) {
     console.error("Frame capture failed", err);
     capturing = false;
     return;
   }
-  const job = enqueueScan(file);
+  if (!pendingFront) {
+    // Step 1 of 2: front captured — same camera now waits for the back.
+    enterBackStep(file);
+    capturing = false;
+    return;
+  }
+  // Step 2 of 2: back captured — queue the pair.
+  const front = pendingFront;
+  exitBackStep();
+  finishCapture(front, file);
+}
+
+// Queue a captured item (front + optional back), then route per scan mode.
+// Callers must have set `capturing = true`; this releases it.
+function finishCapture(frontFile, backFile) {
+  const job = enqueueScan(frontFile, backFile);
   if (isBulkMode()) {
     // Bulk mode: keep streaming, just confirm the grab and let it process.
-    setHint(`Added ✓ — ${QUEUE.jobs.length} in queue. Snap the next card.`);
+    setHint(`Added ✓ — ${QUEUE.jobs.length} in queue. Next ${itemNoun(state.itemType)}: front side.`);
     capturing = false;
   } else {
     // Single mode: stop the camera and offer "wait here" vs "scan next."
@@ -632,8 +716,38 @@ async function captureAndIdentify() {
   }
 }
 
+function enterBackStep(frontFile) {
+  pendingFront = frontFile;
+  pendingFrontUrl = URL.createObjectURL(frontFile);
+  cameraFrontThumb.src = pendingFrontUrl;
+  cameraFrontThumb.hidden = false;
+  captureNowBtn.textContent = "Capture back";
+  skipBackBtn.hidden = false;
+  setHint("Front saved ✓ — flip it over and capture the back.");
+}
+
+function exitBackStep() {
+  pendingFront = null;
+  if (pendingFrontUrl) {
+    URL.revokeObjectURL(pendingFrontUrl);
+    pendingFrontUrl = null;
+  }
+  cameraFrontThumb.hidden = true;
+  cameraFrontThumb.removeAttribute("src");
+  captureNowBtn.textContent = "Capture";
+  skipBackBtn.hidden = true;
+}
+
 captureNowBtn.addEventListener("click", () => {
   if (!capturing && cameraStream) captureAndIdentify();
+});
+
+skipBackBtn.addEventListener("click", () => {
+  if (capturing || !pendingFront) return;
+  capturing = true; // released by finishCapture
+  const front = pendingFront;
+  exitBackStep();
+  finishCapture(front, null);
 });
 
 enableCameraBtn.addEventListener("click", () => {
@@ -2929,6 +3043,220 @@ async function advanceAfterReview(actedId, fallbackHash) {
   }
 }
 
+// --- Account / family login -------------------------------------------------
+// One shared email+password account. Every device starts on its own invisible
+// anonymous account; CREATING the family login links an email+password onto the
+// current anonymous user (same uid — this device's collection is kept), while
+// SIGNING IN switches the device to the shared account (its own anonymous
+// collection is left behind — deliberate: the family collection replaces it).
+const accountContentEl = document.getElementById("account-content");
+
+function renderAccount() {
+  if (!accountContentEl) return;
+  if (!FIREBASE_READY) {
+    accountContentEl.innerHTML =
+      `<p class="muted">Demo mode — Firebase isn't configured, so there's no account to manage.</p>`;
+    return;
+  }
+  if (!currentUser) {
+    accountContentEl.innerHTML = `<p class="muted">Connecting…</p>`;
+    return;
+  }
+
+  if (!currentUser.isAnonymous) {
+    accountContentEl.innerHTML = `
+      <div class="account-box">
+        <p>Signed in as <strong>${esc(currentUser.email || "the family login")}</strong> ✓</p>
+        <p class="muted">Every phone signed in with this email and password sees the same collection — a card scanned on one shows up on all of them.</p>
+        <h3>Add another phone</h3>
+        <ol class="about-list">
+          <li>Open <strong>card-vault-d8fa4.web.app</strong> on that phone.</li>
+          <li>Tap the chip in the top-right corner.</li>
+          <li>Sign in with this same email and password.</li>
+        </ol>
+        <button id="acct-signout" class="big-button" type="button">Sign out on this phone</button>
+        <p id="acct-status" class="status" aria-live="polite"></p>
+      </div>
+    `;
+    document.getElementById("acct-signout").addEventListener("click", handleSignOut);
+    return;
+  }
+
+  // Anonymous: this device still has its own private collection.
+  accountContentEl.innerHTML = `
+    <div class="account-box">
+      <p>Right now this phone keeps its <strong>own private collection</strong> — other phones can't see it.</p>
+      <p>The fix is one shared <strong>family login</strong>: an email and password you all use. Every phone signed in with it sees the same collection.</p>
+      <form id="acct-form" class="account-form">
+        <label for="acct-email">Email</label>
+        <input id="acct-email" class="search-input" type="email" autocomplete="email" inputmode="email" required placeholder="family@example.com" />
+        <label for="acct-password">Password <span class="muted">(at least 6 characters)</span></label>
+        <input id="acct-password" class="search-input" type="password" autocomplete="current-password" minlength="6" required placeholder="••••••••" />
+        <button id="acct-signin" class="big-button primary" type="submit">Sign in to the family collection</button>
+        <button id="acct-forgot" class="link-button" type="button">Forgot the password?</button>
+      </form>
+      <div class="account-create">
+        <h3>First time? Create it once.</h3>
+        <p class="muted">Do this on the phone that already holds your collection — creating the login here <strong>keeps every card on this phone</strong>. Then simply <em>sign in</em> on all the other phones.</p>
+        <button id="acct-create" class="big-button" type="button">Create the family login</button>
+      </div>
+      <p id="acct-status" class="status" aria-live="polite"></p>
+    </div>
+  `;
+  document.getElementById("acct-form").addEventListener("submit", (e) => {
+    e.preventDefault();
+    handleSignIn();
+  });
+  document.getElementById("acct-create").addEventListener("click", handleCreateLogin);
+  document.getElementById("acct-forgot").addEventListener("click", handleForgotPassword);
+}
+
+function acctStatus(msg, isError = false) {
+  const el = document.getElementById("acct-status");
+  if (!el) return;
+  el.textContent = msg;
+  el.classList.toggle("error", isError);
+}
+
+function readAcctFields() {
+  const email = (document.getElementById("acct-email")?.value || "").trim();
+  const password = document.getElementById("acct-password")?.value || "";
+  return { email, password };
+}
+
+// "Create" = upgrade THIS device's anonymous account in place. The uid doesn't
+// change, so the collection already saved on this device becomes the family
+// collection — this is why creation must happen on the phone with the cards.
+async function handleCreateLogin() {
+  const { email, password } = readAcctFields();
+  if (!email || !email.includes("@")) {
+    acctStatus("Type the email to use for the family login, then tap Create.", true);
+    return;
+  }
+  if (password.length < 6) {
+    acctStatus("Choose a password with at least 6 characters.", true);
+    return;
+  }
+  const btn = document.getElementById("acct-create");
+  btn.disabled = true;
+  acctStatus("Creating the family login…");
+  try {
+    await linkWithCredential(auth.currentUser, EmailAuthProvider.credential(email, password));
+    // Same uid, now with an email attached. onAuthStateChanged doesn't re-fire
+    // for a link (the user object is the same), so refresh the UI by hand.
+    currentUser = auth.currentUser;
+    updateUserChip();
+    renderAccount();
+    acctStatus("Family login created ✓ — now sign in with it on the other phones.");
+  } catch (err) {
+    console.error("Create family login failed", err);
+    const code = err && err.code;
+    acctStatus(
+      code === "auth/email-already-in-use"
+        ? "That email already has a family login. Use “Sign in” above instead."
+        : code === "auth/invalid-email"
+          ? "That email doesn't look right — check it and try again."
+          : code === "auth/weak-password"
+            ? "Choose a stronger password (at least 6 characters)."
+            : code === "auth/operation-not-allowed"
+              ? "Email sign-in isn't switched on for this app yet (Firebase console → Authentication → Sign-in method)."
+              : "Couldn't create the login. Check the connection and try again.",
+      true,
+    );
+    btn.disabled = false;
+  }
+}
+
+async function handleSignIn() {
+  const { email, password } = readAcctFields();
+  if (!email || !password) return;
+
+  // Signing in replaces this device's view with the family collection. If this
+  // device's own anonymous account actually holds cards, make that impossible
+  // to do by accident — it's the guard against signing in on the phone that
+  // should have tapped "Create" instead.
+  let ownCards = 0;
+  try {
+    if (currentUser && currentUser.isAnonymous) {
+      const cnt = await getCountFromServer(collection(db, "users", currentUser.uid, "cards"));
+      ownCards = cnt.data().count;
+    }
+  } catch (_) { /* count is best-effort; worst case we skip the warning */ }
+  if (ownCards > 0) {
+    const ok = await confirmDialog({
+      title: `This phone has ${ownCards} saved card${ownCards === 1 ? "" : "s"} of its own`,
+      message:
+        "After you sign in, this phone shows the family collection instead, and " +
+        "its own cards won't be visible anymore. If THIS is the phone with the " +
+        "collection you want to share, cancel and tap “Create the family login” instead.",
+      confirmLabel: "Sign in anyway",
+      cancelLabel: "Cancel",
+      danger: true,
+    });
+    if (!ok) return;
+  }
+
+  const btn = document.getElementById("acct-signin");
+  if (btn) btn.disabled = true;
+  acctStatus("Signing in…");
+  try {
+    await signInWithEmailAndPassword(auth, email, password);
+    // onAuthStateChanged fires with the shared account and re-renders the app.
+    acctStatus("Signed in ✓");
+  } catch (err) {
+    console.error("Family sign-in failed", err);
+    const code = err && err.code;
+    acctStatus(
+      code === "auth/invalid-credential" || code === "auth/wrong-password" ||
+      code === "auth/user-not-found" || code === "auth/invalid-email"
+        ? "Email or password didn't match. If the family login hasn't been created yet, use “Create the family login” below."
+        : code === "auth/too-many-requests"
+          ? "Too many tries — wait a minute and try again, or tap “Forgot the password?”"
+          : code === "auth/operation-not-allowed"
+            ? "Email sign-in isn't switched on for this app yet (Firebase console → Authentication → Sign-in method)."
+            : "Couldn't sign in. Check the connection and try again.",
+      true,
+    );
+    if (btn) btn.disabled = false;
+  }
+}
+
+async function handleForgotPassword() {
+  const { email } = readAcctFields();
+  if (!email || !email.includes("@")) {
+    acctStatus("Type the family login's email above first, then tap “Forgot the password?”", true);
+    return;
+  }
+  try {
+    await sendPasswordResetEmail(auth, email);
+    acctStatus(`Password reset email sent to ${email} — check that inbox.`);
+  } catch (err) {
+    console.error("Password reset failed", err);
+    acctStatus("Couldn't send the reset email. Check the address and try again.", true);
+  }
+}
+
+async function handleSignOut() {
+  const ok = await confirmDialog({
+    title: "Sign out on this phone?",
+    message:
+      "This phone stops showing the family collection and goes back to a " +
+      "private, empty one of its own. Sign in again anytime to rejoin.",
+    confirmLabel: "Sign out",
+    cancelLabel: "Stay signed in",
+  });
+  if (!ok) return;
+  try {
+    await signOut(auth);
+    // Land on a fresh device-local account so scanning keeps working; the
+    // family collection reappears on the next sign-in.
+    await signInAnonymously(auth);
+  } catch (err) {
+    console.error("Sign out failed", err);
+    acctStatus("Couldn't sign out. Check the connection and try again.", true);
+  }
+}
+
 // --- In-app dialogs (replaces native alert/confirm/prompt) -----------------
 // Native dialogs are jarring on phones, can't be styled to match the app, and
 // some mobile browsers suppress them. These accessible equivalents build their
@@ -3452,6 +3780,7 @@ document.addEventListener("click", async (e) => {
 });
 
 // --- Boot ------------------------------------------------------------------
+updateUserChip(); // "Signing in…" until the first auth state resolves
 route();
 
 if ("serviceWorker" in navigator) {

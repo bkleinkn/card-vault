@@ -18,7 +18,7 @@
   <header class="topbar">
     <h1>Card Vault</h1>
     <div class="topbar-right">
-      <div id="user-chip" class="user-chip" aria-live="polite"></div>
+      <a href="#/account" id="user-chip" class="user-chip" aria-live="polite"></a>
       <a href="#/about" class="topbar-link">About</a>
     </div>
   </header>
@@ -29,7 +29,7 @@
       <div class="review-cta" hidden></div>
       <div class="scan-hero">
         <h2>Scan an item</h2>
-        <p class="muted">Tap <strong>Open camera</strong>, fill the frame with the item, then tap <strong>Capture</strong>. Good light helps.</p>
+        <p class="muted">Tap <strong>Open camera</strong> and capture the <strong>front</strong> &mdash; then flip the item over and capture the <strong>back</strong>. Good light helps.</p>
       </div>
 
       <div class="itemtype-select" role="group" aria-label="What are you scanning?">
@@ -64,11 +64,13 @@
       <div id="camera-stage" class="camera-stage" hidden>
         <video id="camera-video" playsinline muted autoplay></video>
         <div class="camera-guide" aria-hidden="true"></div>
+        <img id="camera-front-thumb" class="camera-front-thumb" alt="Captured front" hidden />
         <div id="camera-hint" class="camera-hint" aria-live="polite" aria-atomic="true">Starting camera&hellip;</div>
       </div>
 
       <button id="enable-camera-btn" class="big-button primary" hidden>Enable camera</button>
       <button id="capture-now-btn" class="big-button primary" hidden>Capture</button>
+      <button id="skip-back-btn" class="big-button" hidden>Skip &mdash; save front only</button>
 
       <details id="camera-fallback" class="camera-fallback" hidden>
         <summary>Camera not working? Upload a photo instead</summary>
@@ -225,6 +227,12 @@
       <div id="locations-empty" class="empty-state" hidden></div>
     </section>
 
+    <!-- Account / family login view -->
+    <section class="view" data-view="account" hidden>
+      <h2>Family login</h2>
+      <div id="account-content"></div>
+    </section>
+
     <!-- About view -->
     <section class="view" data-view="about" hidden>
       <h2>About Card Vault</h2>
@@ -265,7 +273,7 @@
 
       <h3>Your privacy</h3>
       <p>Your card photos and collection are stored privately under your account on Google's Firebase platform. Only you can see them. Card images are sent to Anthropic's Claude API for identification, then immediately forgotten by the model &mdash; Anthropic does not retain them or train on them (see their <a href="https://www.anthropic.com/legal/aup" target="_blank" rel="noopener">usage policy</a>).</p>
-      <p style="background: var(--info-bg); border: 1px solid var(--info-border); border-left: 3px solid var(--accent); padding: 12px 16px; border-radius: 8px; margin: 14px 0;"><strong>One important thing to know:</strong> &nbsp;you're signed in automatically, and that sign-in is tied to <strong>this browser on this device</strong>. That means clearing your browser's history or site data, switching to a different device or browser, or using private/incognito browsing can make your saved collection look like it's gone. To keep a safe backup, use the <strong>Export CSV</strong> button on your collection &mdash; it saves a copy you can keep on your computer.</p>
+      <p style="background: var(--info-bg); border: 1px solid var(--info-border); border-left: 3px solid var(--accent); padding: 12px 16px; border-radius: 8px; margin: 14px 0;"><strong>Using more than one phone, or scanning as a family?</strong> &nbsp;Out of the box, your collection is tied to <strong>this browser on this device</strong> &mdash; other phones can't see it, and clearing browser data can make it look like it's gone. The fix is the <a href="#/account">family login</a>: one shared email and password that every phone signs in with, so everyone sees the same collection and it survives a lost or wiped phone. Either way, the <strong>Export CSV</strong> button on your collection is a good extra backup.</p>
 
       <p class="muted" style="margin-top: 32px;">Made for collectors and for families going through inherited collections.</p>
     </section>
