@@ -1498,6 +1498,18 @@ function identifiedSummaryHTML(data) {
   `;
 }
 
+// Value panel shared by result / review / detail. Hidden entirely when there is
+// no estimate; labeled as the user's own numbers once they've edited it.
+function valueBlockHTML(v) {
+  if (!v || (typeof v.low !== "number" && typeof v.high !== "number")) return "";
+  return `
+    <div class="value-block">
+      <div class="label muted">${v.userEdited ? "Your estimate" : "Claude AI ballpark"}</div>
+      <div class="range">$${fmt(v.low || 0)} &ndash; $${fmt(v.high || 0)}</div>
+      <div class="note">${esc(v.note || "")}</div>
+    </div>`;
+}
+
 // --- Result view -----------------------------------------------------------
 function renderResult(data) {
   if (state.editingResult) {
@@ -1518,11 +1530,7 @@ function renderResult(data) {
     ${highValue ? `<div class="high-value-banner">This could be worth a closer look — see the Guide before you sell, clean, or grade it.</div>` : ""}
     ${uncertain ? `<div class="uncertain-banner">I'm not very sure about this one. Does it look right? Tap <strong>Edit details</strong> below to fix anything.</div>` : ""}
     ${identifiedSummaryHTML(data)}
-    <div class="value-block">
-      <div class="label muted">Claude AI ballpark</div>
-      <div class="range">$${fmt(valueEstimate?.low || 0)} &ndash; $${fmt(valueEstimate?.high || 0)}</div>
-      <div class="note">${esc(valueEstimate?.note || "")}</div>
-    </div>
+    ${valueBlockHTML(valueEstimate)}
     ${renderEbayBlock(data.ebayPrices)}
     ${renderPriceLinks(data)}
     <button id="edit-details-btn" class="link-button" style="margin-top: 10px;">Edit details</button>
@@ -1542,7 +1550,7 @@ function renderResultEditForm() {
   const el = document.getElementById("result-card");
   const type = itemTypeOf(state.lastIdentified);
   el.innerHTML =
-    renderEditFormHTML(id, type) +
+    renderEditFormHTML(id, type, state.lastIdentified.valueEstimate) +
     `<div class="row">
        <button id="apply-edits-btn" class="big-button primary">Save changes</button>
        <button id="cancel-edits-btn" class="big-button">Cancel</button>
@@ -1554,6 +1562,7 @@ function renderResultEditForm() {
       ...readEditFormValues(type),
       userEdited: true,
     };
+    state.lastIdentified.valueEstimate = readEditedValueEstimate(state.lastIdentified.valueEstimate);
     state.editingResult = false;
     renderResult(state.lastIdentified);
   });
@@ -1578,7 +1587,52 @@ function sportSelectHTML(identified) {
     </label>`;
 }
 
-function renderEditFormHTML(identified, itemType = "card") {
+// The "what's it worth" fields shown inside every edit form. Prefilled with the
+// current numbers (AI's or the user's own) so a tweak is a two-tap job.
+function valueEditHTML(valueEstimate) {
+  const low = typeof valueEstimate?.low === "number" ? valueEstimate.low : "";
+  const high = typeof valueEstimate?.high === "number" ? valueEstimate.high : "";
+  return `
+    <p class="edit-title" style="margin-top: 18px;">Value estimate</p>
+    <p class="muted edit-value-hint">The AI's ballpark is often optimistic. Put in your own numbers (say, from eBay sold listings) and they replace it everywhere — totals included. Clear both to remove the estimate.</p>
+    <div class="edit-form value-edit-row">
+      <label>Low ($)
+        <input id="ed-value-low" type="number" value="${low}" min="0" step="0.01" inputmode="decimal" placeholder="e.g. 2" />
+      </label>
+      <label>High ($)
+        <input id="ed-value-high" type="number" value="${high}" min="0" step="0.01" inputmode="decimal" placeholder="e.g. 5" />
+      </label>
+    </div>`;
+}
+
+// Read the value-estimate fields back out of an edit form. Returns the estimate
+// to store: the previous object untouched if the numbers didn't change, null if
+// both fields were cleared, or a new user-owned estimate when they differ.
+function readEditedValueEstimate(prev) {
+  const lowEl = document.getElementById("ed-value-low");
+  const highEl = document.getElementById("ed-value-high");
+  if (!lowEl || !highEl) return prev || null;
+  const rawLow = parseFloat(lowEl.value);
+  const rawHigh = parseFloat(highEl.value);
+  let low = Number.isFinite(rawLow) ? Math.max(0, rawLow) : null;
+  let high = Number.isFinite(rawHigh) ? Math.max(0, rawHigh) : null;
+  if (low === null && high === null) return null;   // cleared → no estimate
+  if (low === null) low = high;
+  if (high === null) high = low;
+  if (low > high) [low, high] = [high, low];
+  const prevLow = typeof prev?.low === "number" ? prev.low : null;
+  const prevHigh = typeof prev?.high === "number" ? prev.high : null;
+  if (prev && low === prevLow && high === prevHigh) return prev;  // untouched
+  return {
+    low,
+    high,
+    note: "Your estimate, entered by hand.",
+    userEdited: true,
+    estimatedAt: prev?.estimatedAt || new Date().toISOString(),
+  };
+}
+
+function renderEditFormHTML(identified, itemType = "card", valueEstimate = null) {
   if (itemType === "pack" || itemType === "box") {
     const word = itemType === "pack" ? "pack" : "box";
     return `
@@ -1605,6 +1659,7 @@ function renderEditFormHTML(identified, itemType = "card") {
           <span>Appears factory sealed / unopened</span>
         </label>
       </div>
+      ${valueEditHTML(valueEstimate)}
     `;
   }
   return `
@@ -1635,6 +1690,7 @@ function renderEditFormHTML(identified, itemType = "card") {
         <span>Hall of Famer</span>
       </label>
     </div>
+    ${valueEditHTML(valueEstimate)}
   `;
 }
 
@@ -2382,11 +2438,7 @@ function renderDetailDisplay(el) {
     ${uncertain ? `<div class="uncertain-banner">The AI wasn't very sure about this one. Tap <strong>Edit details</strong> to correct anything.</div>` : ""}
     <div class="result-card">
       ${identifiedSummaryHTML(c)}
-      <div class="value-block">
-        <div class="label muted">Claude AI ballpark</div>
-        <div class="range">$${fmt(c.valueEstimate?.low || 0)} &ndash; $${fmt(c.valueEstimate?.high || 0)}</div>
-        <div class="note">${esc(c.valueEstimate?.note || "")}</div>
-      </div>
+      ${valueBlockHTML(c.valueEstimate)}
       ${renderEbayBlock(c.ebayPrices)}
       ${renderPriceLinks(c)}
     </div>
@@ -2434,7 +2486,7 @@ function renderDetailEditing(el) {
 
   const type = itemTypeOf(c);
   el.innerHTML =
-    renderEditFormHTML(c.identified || {}, type) +
+    renderEditFormHTML(c.identified || {}, type, c.valueEstimate) +
     `<div class="notes-section">
        <label for="detail-location">Location <span class="muted">(where it's stored)</span></label>
        <div class="location-pick">
@@ -2487,15 +2539,17 @@ function renderDetailEditing(el) {
     applyBtn.disabled = true;
     applyBtn.textContent = "Saving...";
     const updatedIdentified = { ...c.identified, ...readEditFormValues(type), userEdited: true };
+    const updatedValue = readEditedValueEstimate(c.valueEstimate);
     const updatedNotes = document.getElementById("detail-notes").value;
     const updatedLocationId = document.getElementById("detail-location").value || null;
     try {
       await updateDoc(doc(db, "users", currentUser.uid, "cards", detailState.cardId), {
         identified: updatedIdentified,
+        valueEstimate: updatedValue,
         userNotes: updatedNotes || null,
         locationId: updatedLocationId,
       });
-      detailState.card = { ...c, identified: updatedIdentified, userNotes: updatedNotes || null, locationId: updatedLocationId };
+      detailState.card = { ...c, identified: updatedIdentified, valueEstimate: updatedValue, userNotes: updatedNotes || null, locationId: updatedLocationId };
       detailState.editing = false;
       renderDetail(detailState.cardId);
     } catch (err) {
@@ -2849,11 +2903,7 @@ function renderReviewDisplay() {
     `
     : `
       ${identifiedSummaryHTML(c)}
-      <div class="value-block">
-        <div class="label muted">Claude AI ballpark</div>
-        <div class="range">$${fmt(c.valueEstimate?.low || 0)} &ndash; $${fmt(c.valueEstimate?.high || 0)}</div>
-        <div class="note">${esc(c.valueEstimate?.note || "")}</div>
-      </div>
+      ${valueBlockHTML(c.valueEstimate)}
       ${renderEbayBlock(c.ebayPrices)}
       ${renderPriceLinks(c)}
       <button id="review-edit-btn" class="link-button" style="margin-top: 10px;">Edit details</button>
@@ -2924,7 +2974,7 @@ function renderReviewEditing() {
   ].join("");
 
   reviewContentEl.innerHTML =
-    renderEditFormHTML(c.identified || {}, type) +
+    renderEditFormHTML(c.identified || {}, type, c.valueEstimate) +
     `<div class="notes-section">
        <label for="review-location">Location <span class="muted">(where it's stored)</span></label>
        <div class="location-pick">
@@ -2973,6 +3023,7 @@ function renderReviewEditing() {
     reviewState.card = {
       ...c,
       identified: editedIdentified,
+      valueEstimate: readEditedValueEstimate(c.valueEstimate),
       // Once the user has hand-entered a name/label, it's no longer "unidentified".
       needsIdentify: !(editedIdentified.player || editedIdentified.itemLabel),
       userNotes: document.getElementById("review-notes").value || null,
@@ -2998,6 +3049,7 @@ async function keepReviewedCard() {
     await updateDoc(doc(db, "users", currentUser.uid, "cards", c.id), {
       status: "kept",
       identified: c.identified || {},
+      valueEstimate: c.valueEstimate || null,
       needsIdentify: isUnidentified(c),
       userNotes: c.userNotes || null,
       locationId: c.locationId || null,

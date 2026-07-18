@@ -108,11 +108,12 @@ users/{uid}/cards/{cardId}
     confidence     // 0-1
     userEdited?    // true if user corrected AI's guess
   }
-  valueEstimate: {
+  valueEstimate: {   // null ⇒ no estimate (unidentified, or user cleared it)
     low            // dollars
     high           // dollars
-    note           // "rough — verify with eBay sold listings"
+    note           // "rough — verify with eBay sold listings" / "Your estimate, entered by hand."
     estimatedAt
+    userEdited?    // true once the user typed their own numbers; UI shows "Your estimate"
   }
   ebayPrices?      // real recent eBay sold-comp stats from identifyCard, or null
                    //   { median, min, max, count, query, searchUrl, fetchedAt }
@@ -139,6 +140,8 @@ The collection view shows only **kept** cards (`status:"kept"` or missing); pend
 **AI eBay descriptions.** The "Generate eBay listing" panel has a "✦ Write a better description with AI" button → `generateListing` Cloud Function (Opus 4.8 + `web_search_20260209`) returns a researched, sales-oriented description (editable, templated fallback already in the box). Gated through `generateListingDescription()`, which returns a mock when `USE_MOCK_AI`.
 
 **Inline locations.** The card detail edit form has a "+ New" button next to the Location select that creates a storage location (writes `users/{uid}/locations/{id}`) and assigns it without leaving the page.
+
+**Editable value estimate.** Every edit form (result, review, detail) has Low/High $ fields. User-entered numbers replace the AI's everywhere — value panel (labeled "Your estimate" instead of "Claude AI ballpark"), collection totals, sorts, high-value banner, CSV. Clearing both fields removes the estimate (`valueEstimate: null`, panel hidden). Handled by `valueEditHTML` / `readEditedValueEstimate` / `valueBlockHTML` in app.js; unchanged numbers keep the original AI object untouched. The identify prompts also anchor the AI's range to real eBay SOLD prices for raw cards in visible condition (estimates skewed high before — training data over-represents asking/book/graded prices).
 
 **Front + back in one capture.** The live camera is a guided two-shot: capture the front, then the same shutter becomes "Capture back" (corner thumbnail shows the captured front; a "Skip — save front only" button queues front-only). The pair travels as one queue job → one card, in both single and Bulk mode; closing the camera mid-pair queues the front alone so nothing is lost. Both images go to `identifyCard` and are stored as `imageFrontUrl` / `imageBackUrl`.
 

@@ -24,6 +24,15 @@ const CARD_PROMPT = `
 You are a vintage sports card expert. The user has photographed a single sports card.
 Identify it as accurately as possible. Lean conservative on confidence.
 
+For valueEstimate, estimate what THIS card would actually fetch today sold RAW (ungraded)
+in the condition visible in the photos. Anchor to real recent eBay SOLD prices — NOT dealer
+asking prices, price-guide "book" values, or graded-slab sales, all of which run far above
+what raw cards really sell for. Reality check: vintage commons and minor stars (1950s–1970s)
+usually sell raw for $1–10 total; only true stars, key rookies, and Hall of Famers in strong
+condition go meaningfully higher. If the photos show wear (rounded corners, creases, writing,
+stains), shade the range down further. When unsure, estimate LOWER, and keep the range tight
+rather than quoting a wide hopeful spread.
+
 Return JSON ONLY in this exact shape (no prose, no markdown fences):
 {
   "identified": {
@@ -51,6 +60,8 @@ const PACK_PROMPT = `
 You are a vintage sports card expert. The user has photographed a SEALED PACK of sports cards
 (a wax pack, cello pack, rack pack, foil pack, jumbo pack, etc.) — NOT a single card.
 Identify the product as accurately as possible. Lean conservative on confidence.
+Anchor valueEstimate to real recent eBay SOLD prices for comparable sealed packs — not
+asking prices or graded/authenticated-pack sales. When unsure, estimate lower.
 
 Return JSON ONLY in this exact shape (no prose, no markdown fences):
 {
@@ -78,6 +89,8 @@ const BOX_PROMPT = `
 You are a vintage sports card expert. The user has photographed a SEALED BOX of sports cards
 (a wax box, hobby box, blaster box, jumbo box, rack box, cello box, etc.) — NOT a single card or pack.
 Identify the product as accurately as possible. Lean conservative on confidence.
+Anchor valueEstimate to real recent eBay SOLD prices for comparable sealed boxes — not
+asking prices or graded/authenticated sales. When unsure, estimate lower.
 
 Return JSON ONLY in this exact shape (no prose, no markdown fences):
 {

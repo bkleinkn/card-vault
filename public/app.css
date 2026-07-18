@@ -1101,6 +1101,21 @@ p { color: var(--ink-soft); margin: 8px 0; }
   letter-spacing: 0.01em;
 }
 
+/* Low/High value-estimate fields sit side by side inside the edit form. */
+.edit-form.value-edit-row {
+  flex-direction: row;
+  gap: 12px;
+}
+
+.edit-form.value-edit-row label {
+  flex: 1;
+}
+
+.edit-value-hint {
+  font-size: 13px;
+  margin: 4px 0 10px;
+}
+
 .edit-form label.checkbox {
   flex-direction: row;
   align-items: center;
