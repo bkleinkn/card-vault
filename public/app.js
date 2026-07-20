@@ -571,6 +571,11 @@ const cameraFallback = document.getElementById("camera-fallback");
 
 let cameraStream = null;
 let capturing = false;          // guards against double-capture mid-identify
+// getUserMedia is in flight. iOS shows its camera-permission prompt as a system
+// modal that BACKGROUNDS the page, so visibilitychange fires on the way in and
+// again on the way back — and the handler below used to tear the camera down on
+// the way back, killing the stream the user had just granted.
+let openingCamera = false;
 let pendingFront = null;        // captured front File waiting for its back photo
 let pendingFrontUrl = null;     // object URL behind the corner thumbnail
 
@@ -631,6 +636,7 @@ async function startScanCamera() {
     stopScanCamera();                 // dead — tear down and reopen below
   }
   enableCameraBtn.hidden = true;
+  openingCamera = true;
   try {
     cameraStream = await navigator.mediaDevices.getUserMedia({
       video: { facingMode: { ideal: "environment" }, width: { ideal: 1920 }, height: { ideal: 1080 } },
@@ -647,6 +653,8 @@ async function startScanCamera() {
       showCameraFallback("No camera available. Upload a photo instead.");
     }
     return;
+  } finally {
+    openingCamera = false;
   }
   exitBackStep();                     // a fresh camera always starts on the front
 
@@ -842,12 +850,21 @@ enableCameraBtn.addEventListener("click", () => {
 // Release the camera when the tab is hidden. On return, drop back to the
 // idle "Open camera" state — never silently re-open the camera.
 document.addEventListener("visibilitychange", () => {
+  // Ignore the two flips iOS generates around its permission prompt: the page
+  // is backgrounded to show the modal and foregrounded again when the user
+  // answers. Acting on either edge stopped the camera the instant it was
+  // allowed — the "light comes on and goes straight back off" symptom.
+  if (openingCamera) return;
+
   if (document.hidden) {
     stopScanCamera();
   } else if (!capturing && (location.hash || "#/scan").startsWith("#/scan")) {
     // A single-mode job is still in flight (its "Identifying…" panel is up and
     // will auto-open when ready) — don't wipe it by resetting to the camera.
     if (QUEUE.waitingJobId) return;
+    // Already streaming: leave it be. showCameraStart() begins by stopping the
+    // camera, so calling it here would shut down a perfectly good preview.
+    if (cameraStream) return;
     showCameraStart();
   }
 });
