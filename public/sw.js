@@ -8,7 +8,10 @@
 // Bump CACHE on breaking changes — the activate handler wipes everything
 // else.
 
-const CACHE = "card-vault-v5";
+// v6: forces a full cache wipe. A device holding a cached older index.html
+// against a newer app.js hit a null element and died during module init —
+// bumping this purges the stale shell on the next load.
+const CACHE = "card-vault-v6";
 
 // Precache the app shell so a first-time offline visit still works.
 const SHELL_ASSETS = ["./", "index.html", "app.css", "app.js", "manifest.json"];

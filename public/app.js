@@ -552,8 +552,20 @@ const cameraStage = document.getElementById("camera-stage");
 const cameraVideo = document.getElementById("camera-video");
 const cameraHint = document.getElementById("camera-hint");
 const captureNowBtn = document.getElementById("capture-now-btn");
+// These two arrived with the front→back capture flow. Guard every use of them:
+// if a device is running a cached older index.html against a newer app.js they
+// are null, and an unguarded deref here throws during module evaluation — which
+// silently kills every listener registered below it, including "Open camera".
+// (That is exactly how an iPhone ended up unable to open the camera while a
+// Pixel on the same build was fine.)
 const skipBackBtn = document.getElementById("skip-back-btn");
 const cameraFrontThumb = document.getElementById("camera-front-thumb");
+if (!skipBackBtn || !cameraFrontThumb) {
+  console.warn(
+    "Scan view is missing the front/back capture elements — the page shell is " +
+      "older than this script. Front-only capture still works; refresh to update.",
+  );
+}
 const enableCameraBtn = document.getElementById("enable-camera-btn");
 const cameraFallback = document.getElementById("camera-fallback");
 
@@ -665,7 +677,7 @@ function stopScanCamera() {
   cameraVideo.srcObject = null;
   cameraStage.hidden = true;
   captureNowBtn.hidden = true;
-  skipBackBtn.hidden = true;
+  if (skipBackBtn) skipBackBtn.hidden = true;
 }
 
 async function captureFrameFile(name) {
@@ -726,10 +738,12 @@ function finishCapture(frontFile, backFile) {
 function enterBackStep(frontFile) {
   pendingFront = frontFile;
   pendingFrontUrl = URL.createObjectURL(frontFile);
-  cameraFrontThumb.src = pendingFrontUrl;
-  cameraFrontThumb.hidden = false;
+  if (cameraFrontThumb) {
+    cameraFrontThumb.src = pendingFrontUrl;
+    cameraFrontThumb.hidden = false;
+  }
   captureNowBtn.textContent = "Capture back";
-  skipBackBtn.hidden = false;
+  if (skipBackBtn) skipBackBtn.hidden = false;
   setHint("Front saved ✓ — flip it over and capture the back.");
 }
 
@@ -739,17 +753,19 @@ function exitBackStep() {
     URL.revokeObjectURL(pendingFrontUrl);
     pendingFrontUrl = null;
   }
-  cameraFrontThumb.hidden = true;
-  cameraFrontThumb.removeAttribute("src");
+  if (cameraFrontThumb) {
+    cameraFrontThumb.hidden = true;
+    cameraFrontThumb.removeAttribute("src");
+  }
   captureNowBtn.textContent = "Capture";
-  skipBackBtn.hidden = true;
+  if (skipBackBtn) skipBackBtn.hidden = true;
 }
 
 captureNowBtn.addEventListener("click", () => {
   if (!capturing && cameraStream) captureAndIdentify();
 });
 
-skipBackBtn.addEventListener("click", () => {
+if (skipBackBtn) skipBackBtn.addEventListener("click", () => {
   if (capturing || !pendingFront) return;
   capturing = true; // released by finishCapture
   const front = pendingFront;
