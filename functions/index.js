@@ -14,6 +14,12 @@ const Anthropic = require("@anthropic-ai/sdk");
 admin.initializeApp();
 
 const ANTHROPIC_API_KEY = defineSecret("ANTHROPIC_API_KEY");
+// Optional. Paid SportsCardsPro / PriceCharting subscription token. Until it's
+// set to a real value the market-price lookup is skipped entirely and behaviour
+// is unchanged. Rotate with:
+//   firebase functions:secrets:set SPORTSCARDSPRO_TOKEN --project=card-vault-d8fa4
+//   firebase deploy --only functions --project=card-vault-d8fa4
+const SPORTSCARDSPRO_TOKEN = defineSecret("SPORTSCARDSPRO_TOKEN");
 
 // --- Identify prompts & schemas --------------------------------------------
 // Three item types share one Cloud Function. Each gets its own frozen system
@@ -281,9 +287,14 @@ function aiServiceError(err, fallbackMessage) {
 // (it requires a reCAPTCHA/site key + Firebase console setup, so it's left for
 // a follow-up to avoid breaking the live anonymous-auth app).
 exports.identifyCard = onCall(
-  // timeoutSeconds bumped above the 60s default because we also await an eBay
-  // scrape after the model call.
-  { secrets: [ANTHROPIC_API_KEY], cors: true, region: "us-central1", timeoutSeconds: 120 },
+  // timeoutSeconds bumped above the 60s default because we also await a price
+  // lookup after the model call.
+  {
+    secrets: [ANTHROPIC_API_KEY, SPORTSCARDSPRO_TOKEN],
+    cors: true,
+    region: "us-central1",
+    timeoutSeconds: 120,
+  },
   async (request) => {
     if (!request.auth) {
       throw new HttpsError("unauthenticated", "Sign in required.");
@@ -389,7 +400,28 @@ async function identifyImages(frontImageBase64, backImageBase64, type) {
     queryParts = known ? [ident.year, ident.set, ident.itemLabel, "sealed"] : null;
   }
   if (queryParts) {
-    parsed.ebayPrices = await fetchEbaySoldPrices(queryParts.filter(Boolean).join(" "));
+    const query = queryParts.filter(Boolean).join(" ");
+
+    // Prefer a real market price. Only fall back to the eBay scrape when no
+    // SportsCardsPro token is configured — with one, the scrape is a guaranteed
+    // 403 and pure latency.
+    const market = await fetchMarketPrice(query);
+    if (market) {
+      parsed.marketPrice = market;
+      // Anchor the headline estimate to observed prices instead of the model's
+      // recollection. A modest band around the ungraded figure keeps it honest
+      // about being approximate; the note names the source and the exact
+      // number so it can be sanity-checked against the site.
+      parsed.valueEstimate = {
+        low: Math.max(0.5, Math.round(market.ungraded * 75) / 100),
+        high: Math.round(market.ungraded * 125) / 100,
+        note: `Based on the SportsCardsPro ungraded market price ($${market.ungraded.toFixed(2)}).`,
+        estimatedAt: new Date().toISOString(),
+        source: "sportscardspro",
+      };
+    } else if (!scpToken()) {
+      parsed.ebayPrices = await fetchEbaySoldPrices(query);
+    }
   }
 
   return parsed;
@@ -404,7 +436,12 @@ async function identifyImages(frontImageBase64, backImageBase64, type) {
 // same grant the share functions / onCardDeleted already require on this
 // org-parented project (roles/datastore.user + roles/storage.objectViewer).
 exports.identifyStored = onCall(
-  { secrets: [ANTHROPIC_API_KEY], cors: true, region: "us-central1", timeoutSeconds: 120 },
+  {
+    secrets: [ANTHROPIC_API_KEY, SPORTSCARDSPRO_TOKEN],
+    cors: true,
+    region: "us-central1",
+    timeoutSeconds: 120,
+  },
   async (request) => {
     if (!request.auth) {
       throw new HttpsError("unauthenticated", "Sign in required.");
@@ -451,6 +488,7 @@ exports.identifyStored = onCall(
           identified: parsed.identified,
           valueEstimate: parsed.valueEstimate || null,
           ebayPrices: parsed.ebayPrices || null,
+          marketPrice: parsed.marketPrice || null,
           needsIdentify: false,
         },
         { merge: true },
@@ -583,6 +621,86 @@ exports.generateListing = onCall(
     return { description };
   },
 );
+
+// --- Real market prices (SportsCardsPro) ------------------------------------
+// Why this exists: eBay's sold-listings page returns 403 to every request from
+// a Cloud Function (its bot protection blocks datacenter IP ranges), so
+// fetchEbaySoldPrices below has never returned a single comp in production —
+// every estimate the app has ever shown came from the model's training
+// knowledge, which skews high (asking / book / graded prices). SportsCardsPro's
+// API answers the same question, and unlike eBay it serves datacenter IPs.
+//
+// Requires a paid subscription token; without one this is a no-op and the app
+// falls back to the previous behaviour.
+
+// The configured token, or null when it hasn't been set to a real value yet.
+function scpToken() {
+  let t = "";
+  try {
+    t = (SPORTSCARDSPRO_TOKEN.value() || "").trim();
+  } catch {
+    return null; // secret not available in this context
+  }
+  if (!t || /^unset$/i.test(t)) return null;
+  return t;
+}
+
+// The API encodes money as an integer number of pennies. Returns dollars, or
+// null for missing/zero (it uses 0 for "no data", which is not a real price).
+function scpDollars(v) {
+  const n = Number(v);
+  if (!Number.isFinite(n) || n <= 0) return null;
+  return Math.round(n) / 100;
+}
+
+// Look up one item's market price. Returns null on any failure — a pricing
+// lookup must never be able to fail a scan.
+async function fetchMarketPrice(query) {
+  const token = scpToken();
+  if (!token || !query) return null;
+
+  const url =
+    "https://www.sportscardspro.com/api/product" +
+    `?t=${encodeURIComponent(token)}&q=${encodeURIComponent(query)}`;
+
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 8000);
+  let body;
+  try {
+    const res = await fetch(url, { signal: controller.signal });
+    // Auth failures come back as 403 WITH a JSON body, so parse before judging.
+    body = await res.json();
+  } catch (err) {
+    console.warn(`SportsCardsPro lookup failed for "${query}":`, err && err.message);
+    return null;
+  } finally {
+    clearTimeout(timer);
+  }
+
+  if (!body || body.status !== "success") {
+    console.warn(
+      `SportsCardsPro: ${(body && (body["error-message"] || body.status)) || "no body"} for "${query}"`,
+    );
+    return null;
+  }
+
+  // Log the field names on every success until the grade mapping is confirmed
+  // against real responses — cheap, and it beats guessing from docs.
+  console.log(`SportsCardsPro fields for "${query}":`, Object.keys(body).join(","));
+
+  const ungraded = scpDollars(body["loose-price"]);
+  if (ungraded === null) return null;
+
+  return {
+    ungraded,
+    grade9: scpDollars(body["graded-price"]),
+    psa10: scpDollars(body["manual-only-price"]),
+    productName: body["product-name"] || null,
+    setName: body["console-name"] || null,
+    query,
+    fetchedAt: new Date().toISOString(),
+  };
+}
 
 // Pure, side-effect-free parser: turn an eBay sold-listings HTML page into
 // price stats. Returns { count: 0 } when no usable prices are found, otherwise

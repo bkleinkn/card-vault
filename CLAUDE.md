@@ -51,7 +51,13 @@ If a feature requires collector jargon to use, it doesn't belong in v1.
 
 ### Pricing data
 
-eBay's public sold-listings API was deprecated. Real options:
+**The eBay scrape has never worked in production.** `fetchEbaySoldPrices` gets **HTTP 403 on every request** — eBay's bot protection blocks Google datacenter IPs. Verified 2026-07-20: all 60 cards in the database carry an `ebayPrices` object and *none* has a single comp. So every estimate the app has ever displayed came from the model's training knowledge, which skews high (asking / book / graded prices dominate that data). eBay's official sold-price feed (Marketplace Insights API) is a Limited Release restricted to approved enterprise partners and is not obtainable by an independent developer.
+
+**Replacement: SportsCardsPro** (`fetchMarketPrice`), the sports-card arm of PriceCharting. `GET https://www.sportscardspro.com/api/product?t=<token>&q=<query>` — token in the `t` query param, prices as integer pennies, `status: "success"|"error"`. Critically it **serves datacenter IPs** (verified: a bad-token probe from this machine returned a clean JSON error, not a block), so it works from a Cloud Function where eBay cannot. Needs a paid subscription (~$6/mo, $59/yr). Gated behind the optional `SPORTSCARDSPRO_TOKEN` secret: while unset (placeholder value `UNSET`) the lookup is skipped entirely and behaviour is unchanged. When a price is found it becomes the card's `valueEstimate` (±25% band around the ungraded price, `source: "sportscardspro"`, labelled "Market price (SportsCardsPro)" in green), replacing the AI guess; the eBay scrape is then skipped as a guaranteed 403.
+
+⚠️ **Unverified:** the grade-tier field mapping (`graded-price` → grade 9, `manual-only-price` → PSA 10) is inferred from PriceCharting's legacy schema and has never seen a real response. `loose-price` → ungraded is the one that matters and is well attested. `fetchMarketPrice` logs the full key set on every success — check those logs against a real card before trusting the graded tiers.
+
+Other options considered:
 
 - **eBay Marketplace Insights API** — 90 days of sold data, but requires approval (slow)
 - **PriceCharting / Card Ladder / 130point** — paid APIs
@@ -115,6 +121,8 @@ users/{uid}/cards/{cardId}
     estimatedAt
     userEdited?    // true once the user typed their own numbers; UI shows "Your estimate"
   }
+  marketPrice?     // real market price from SportsCardsPro, or null
+                   //   { ungraded, grade9?, psa10?, productName, setName, query, fetchedAt }
   ebayPrices?      // real recent eBay sold-comp stats from identifyCard, or null
                    //   { median, min, max, count, query, searchUrl, fetchedAt }
                    //   (when no comps found: { query, count: 0, searchUrl })
@@ -210,5 +218,6 @@ card-vault/
 - **GitHub:** [github.com/bkleinkn/card-vault](https://github.com/bkleinkn/card-vault)
 - **Per-scan cost:** ~$0.01–0.03 (Claude Opus 4.8 with prompt-caching kicking in after the first scan). `generateListing` (AI eBay descriptions) also uses Opus 4.8 with web search.
 - **Secret rotation:** if `ANTHROPIC_API_KEY` ever needs swapping, run `firebase functions:secrets:set ANTHROPIC_API_KEY --project=card-vault-d8fa4` then `firebase deploy --only functions --project=card-vault-d8fa4`.
+- **Turning on real market prices:** subscribe to [SportsCardsPro](https://www.sportscardspro.com/) (Legendary tier, ~$6/mo — API access is included), copy the 40-character token from the account page, then `firebase functions:secrets:set SPORTSCARDSPRO_TOKEN --project=card-vault-d8fa4` and `firebase deploy --only functions --project=card-vault-d8fa4`. Verify with `gcloud logging read '... textPayload:SportsCardsPro'` — a successful lookup logs the response's field names. To turn it back off, set the secret to `UNSET` and redeploy.
 - **USE_MOCK_AI escape hatch:** Flip `const USE_MOCK_AI = true;` in `public/app.js` to temporarily revert all scans to the mocked 1956 Mantle without redeploying the function (useful for cost-free UX iteration). Then `firebase deploy --only hosting`.
 - **Cross-PC dev:** `git clone https://github.com/bkleinkn/card-vault.git && cd card-vault && npm install && cd functions && npm install`. Firebase deploys from any machine work after `firebase login` (as bkleinkn@gmail.com) — secrets stay server-side.

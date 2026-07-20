@@ -977,6 +977,7 @@ async function persistPendingCard(job) {
     identified: result.identified || {},
     valueEstimate: result.valueEstimate || null,
     ebayPrices: result.ebayPrices || null,
+    marketPrice: result.marketPrice || null,
     needsIdentify,
     locationId: state.bulkLocationId || null,
     userNotes: null,
@@ -1586,9 +1587,17 @@ function identifiedSummaryHTML(data) {
 // no estimate; labeled as the user's own numbers once they've edited it.
 function valueBlockHTML(v) {
   if (!v || (typeof v.low !== "number" && typeof v.high !== "number")) return "";
+  // Say where the number came from. A real market price and the model's
+  // recollection are very different things and shouldn't look identical.
+  const label = v.userEdited
+    ? "Your estimate"
+    : v.source === "sportscardspro"
+      ? "Market price (SportsCardsPro)"
+      : "Claude AI ballpark";
+  const sourced = !v.userEdited && v.source === "sportscardspro";
   return `
-    <div class="value-block">
-      <div class="label muted">${v.userEdited ? "Your estimate" : "Claude AI ballpark"}</div>
+    <div class="value-block${sourced ? " sourced" : ""}">
+      <div class="label muted">${esc(label)}</div>
       <div class="range">$${fmt(v.low || 0)} &ndash; $${fmt(v.high || 0)}</div>
       <div class="note">${esc(v.note || "")}</div>
     </div>`;

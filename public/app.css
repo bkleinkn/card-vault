@@ -2215,6 +2215,15 @@ body.viewing-share { padding-bottom: 28px; }
   .bulk-location .location-pick { flex-wrap: wrap; }
 }
 
+/* A value backed by a real market price, not the model's recollection. */
+.value-block.sourced {
+  border-color: rgba(52, 211, 153, 0.5);
+}
+
+.value-block.sourced .label {
+  color: var(--emerald, #34d399);
+}
+
 /* ---------- AI outage banner ----------
    Shown when the AI service itself is unavailable (no credits, rejected key,
    rate limit) so a billing problem never again reads as "the AI can't read
