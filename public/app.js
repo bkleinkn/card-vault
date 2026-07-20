@@ -648,14 +648,14 @@ async function startScanCamera() {
     }
     return;
   }
-  cameraVideo.srcObject = cameraStream;
   exitBackStep();                     // a fresh camera always starts on the front
 
-  // Reveal the stage BEFORE starting playback. iOS Safari will not start a
-  // video inside a display:none container: play() can return a promise that
-  // never settles, so awaiting it here left the UI frozen right after the user
-  // granted camera permission — prompt accepted, then nothing. Chrome settles
-  // it immediately, which is why Android was unaffected.
+  // Reveal the stage BEFORE touching the video element. iOS Safari decides
+  // whether a video may start playing at the moment the stream is attached,
+  // and an element inside a display:none container fails that check — it then
+  // sits paused forever, showing a black box. (It also made play() return a
+  // promise that never settled, which previously froze the whole flow.)
+  // Chrome doesn't care, which is why Android was never affected.
   cameraStage.hidden = false;
   captureNowBtn.hidden = false;
   cameraFallback.hidden = false;      // keep the escape hatch reachable, collapsed
@@ -666,22 +666,52 @@ async function startScanCamera() {
       : `Fill the frame with the front of the ${itemNoun(state.itemType)}, then tap Capture`,
   );
 
-  // Fire-and-forget: the element is autoplay + muted + playsinline, so iOS
-  // starts it on its own once visible. Never await this — a hung promise must
-  // not be able to block the interface again.
-  Promise.resolve(cameraVideo.play()).catch(() => {});
+  // Now that the element is on screen, attach the stream and start it.
+  cameraVideo.srcObject = cameraStream;
+  tryPlayCamera();
   watchCameraFrames();
+
+  // Small screens: the stage is tall enough to push the shutter below the fold.
+  try {
+    captureNowBtn.scrollIntoView({ block: "nearest" });
+  } catch (_) { /* not critical */ }
 }
 
-// Safety net: a camera that opens but produces no frames should say so rather
-// than leaving the user staring at a blank box. Covers the iOS case above, a
-// camera held by another app, and a track the OS kills at startup.
+// Starting playback is unreliable on iOS: awaiting getUserMedia consumes the
+// user gesture, so play() can reject even though the element is muted +
+// playsinline. Retry on the events that mean the media is actually ready, and
+// never await — a hung promise must not be able to block the interface.
+function tryPlayCamera() {
+  const attempt = () => {
+    try {
+      Promise.resolve(cameraVideo.play()).catch(() => {});
+    } catch (_) { /* older browsers return undefined */ }
+  };
+  attempt();
+  cameraVideo.addEventListener("loadedmetadata", attempt, { once: true });
+  cameraVideo.addEventListener("canplay", attempt, { once: true });
+}
+
+// Tapping the picture is a fresh user gesture — the most reliable way to start
+// a stubborn video on iOS. Harmless when it's already playing.
+cameraStage.addEventListener("click", () => {
+  if (cameraStream && cameraVideo.paused) tryPlayCamera();
+});
+
+// Safety net: a camera that opens but never paints should say so rather than
+// leaving the user staring at a black box. Checks `paused` as well as frame
+// size — metadata (and so videoWidth) can load while the element stays paused,
+// which is exactly the black-screen case on iOS.
 let frameWatchdog = null;
 function watchCameraFrames() {
   clearTimeout(frameWatchdog);
   frameWatchdog = setTimeout(() => {
-    if (!cameraStream || cameraVideo.videoWidth > 0) return; // frames flowing
-    console.warn("Camera opened but produced no frames after 6s.");
+    if (!cameraStream) return;
+    if (cameraVideo.videoWidth > 0 && !cameraVideo.paused) return; // painting
+    console.warn(
+      "Camera opened but isn't painting after 6s — " +
+        `paused=${cameraVideo.paused} videoWidth=${cameraVideo.videoWidth}`,
+    );
     stopScanCamera();
     enableCameraBtn.hidden = false;
     enableCameraBtn.textContent = "Try camera again";
