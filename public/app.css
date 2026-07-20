@@ -2215,6 +2215,47 @@ body.viewing-share { padding-bottom: 28px; }
   .bulk-location .location-pick { flex-wrap: wrap; }
 }
 
+/* ---------- AI outage banner ----------
+   Shown when the AI service itself is unavailable (no credits, rejected key,
+   rate limit) so a billing problem never again reads as "the AI can't read
+   your cards." Injected at the top of #view-root, so it rides every view. */
+.ai-outage-banner {
+  background: rgba(244, 63, 94, 0.09);
+  border: 1px solid rgba(244, 63, 94, 0.45);
+  border-left: 3px solid var(--rose);
+  border-radius: var(--radius);
+  padding: 14px 16px;
+  margin: 0 0 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.ai-outage-banner p {
+  margin: 0;
+  font-size: 14px;
+  line-height: 1.5;
+}
+
+.ai-outage-title {
+  font-weight: 700;
+  font-size: 15px;
+  color: var(--ink);
+}
+
+.ai-outage-banner .control-btn {
+  align-self: flex-start;
+}
+
+/* ---------- Bulk identify (review view) ---------- */
+.bulk-identify {
+  margin: 4px 0 18px;
+}
+
+.bulk-identify .status {
+  margin: 8px 0 0;
+}
+
 /* ---------- Front-then-back capture ----------
    After the front is captured, a small confirmation thumbnail pins to the
    corner of the live camera while the hint asks for the back of the card. */

@@ -232,6 +232,51 @@ async function enforceDailyQuota(uid, kind, limit) {
   }
 }
 
+// Turn an Anthropic SDK error into an HttpsError the CLIENT can act on, via a
+// machine-readable `details.reason`. This matters most for billing: when the
+// Anthropic credit balance hits zero, every call fails in ~0.5s, and the app
+// used to record each one as a plain "couldn't identify" — so a whole scanning
+// session landed in review as "Unidentified card", indistinguishable from bad
+// photos. (Observed 2026-07-19: 40 scans in a row.) Name the real cause instead.
+function aiServiceError(err, fallbackMessage) {
+  const status = err && err.status;
+  const apiMessage =
+    (err && err.error && err.error.error && err.error.error.message) ||
+    (err && err.message) ||
+    "";
+
+  if (/credit balance is too low/i.test(apiMessage)) {
+    return new HttpsError(
+      "failed-precondition",
+      "Card Vault's AI account is out of credits, so nothing can be identified " +
+        "right now. Add credits in the Anthropic console, then try again.",
+      { reason: "no_credits" },
+    );
+  }
+  if (status === 401 || status === 403) {
+    return new HttpsError(
+      "failed-precondition",
+      "Card Vault's AI key was rejected. It may have been revoked or rotated.",
+      { reason: "bad_key" },
+    );
+  }
+  if (status === 429) {
+    return new HttpsError(
+      "resource-exhausted",
+      "The AI is handling too many requests right now. Wait a minute and try again.",
+      { reason: "rate_limited" },
+    );
+  }
+  if (status === 503 || status === 529) {
+    return new HttpsError(
+      "unavailable",
+      "The AI service is temporarily overloaded. Try again in a minute.",
+      { reason: "overloaded" },
+    );
+  }
+  return new HttpsError("internal", fallbackMessage, { reason: "unknown" });
+}
+
 // NOTE: For stronger abuse protection, App Check is the recommended next step
 // (it requires a reCAPTCHA/site key + Firebase console setup, so it's left for
 // a follow-up to avoid breaking the live anonymous-auth app).
@@ -303,7 +348,7 @@ async function identifyImages(frontImageBase64, backImageBase64, type) {
     });
   } catch (err) {
     console.error("Anthropic API call failed:", err);
-    throw new HttpsError("internal", `Could not identify ${label}. Try again.`);
+    throw aiServiceError(err, `Could not identify ${label}. Try again.`);
   }
 
   // Note a non-"end_turn" stop_reason (e.g. "max_tokens"/"refusal") for
@@ -435,10 +480,15 @@ Rules you MUST follow:
 - Use web search to ground the description in real, current facts about the player, set, or product
   (significance, notable rookies/cards, why it's collectible, general market interest). Do NOT invent or
   promise specific prices, grades, or sales — the seller verifies pricing separately.
-- The item is RAW / UNGRADED and sold as-is from a personal collection. Always tell buyers to review the
-  photos carefully to judge condition themselves. Do not claim or guarantee a condition or authenticity grade.
+- The item is RAW / UNGRADED and sold as-is from a personal collection. Include exactly ONE short sentence
+  telling buyers to judge condition from the photos. Do not claim or guarantee a condition or authenticity grade.
 - Encourage interest honestly — highlight genuine desirability, but never overstate, fabricate, or mislead.
-- Write in clean paragraphs (and a short bulleted highlights list when useful). No markdown headers, no emojis.
+- LENGTH IS A HARD REQUIREMENT: 90-150 words TOTAL. Buyers skim on phones; long listings lose them.
+  Use either two short paragraphs, or one short paragraph plus up to four brief bullet points.
+  Cut anything generic — no filler about shipping, bidding, combined postage, or collecting in general.
+- Search the web at most twice, and only when it would add a concrete fact worth printing. If you already
+  know enough to write the description, skip searching entirely and write it.
+- Write in clean prose. No markdown headers, no emojis, no ALL-CAPS section labels.
 - Output ONLY the finished description text. No preamble, no "Here is", no surrounding quotes.
 `.trim();
 
@@ -506,13 +556,18 @@ exports.generateListing = onCall(
         model: "claude-opus-4-8",
         max_tokens: 2000,
         thinking: { type: "adaptive" },
-        tools: [{ type: "web_search_20260209", name: "web_search" }],
+        // Latency knobs. A 150-word listing blurb doesn't need deep
+        // deliberation, and each web search is a slow round trip — unbounded
+        // searching was the bulk of the ~60s the user was waiting. Low effort
+        // plus a hard 2-search cap keeps it grounded but quick.
+        output_config: { effort: "low" },
+        tools: [{ type: "web_search_20260209", name: "web_search", max_uses: 2 }],
         system: [{ type: "text", text: LISTING_SYSTEM, cache_control: { type: "ephemeral" } }],
         messages: [{ role: "user", content: userMessage }],
       });
     } catch (err) {
       console.error("generateListing API call failed:", err);
-      throw new HttpsError("internal", "Could not write a description. Try again.");
+      throw aiServiceError(err, "Could not write a description. Try again.");
     }
 
     // Concatenate the final text blocks (web search interleaves tool blocks).

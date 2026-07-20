@@ -871,12 +871,20 @@ async function runJob(job) {
     // the review screen; only the demo / pre-auth path treats it as an error.
     let result = null;
     let identifyFailed = false;
-    try {
-      result = await identifyCard(job.frontFile, job.backFile, job.itemType);
-    } catch (ierr) {
-      console.warn("Background identify failed — saving the scan to identify later", ierr);
-      result = null;
+    if (aiHardDown()) {
+      // The API is known-dead for every request (no credits / rejected key), so
+      // calling it would just burn ~0.5s and a daily-quota unit to fail again.
+      // Skip straight to persisting the scan; it can be identified later.
       identifyFailed = true;
+    } else {
+      try {
+        result = await identifyCard(job.frontFile, job.backFile, job.itemType);
+      } catch (ierr) {
+        console.warn("Background identify failed — saving the scan to identify later", ierr);
+        result = null;
+        identifyFailed = true;
+        setAiOutage(aiOutageFrom(ierr));
+      }
     }
     if (!QUEUE.jobs.includes(job)) return; // discarded mid-flight
     job.result = result;
@@ -887,13 +895,17 @@ async function runJob(job) {
     // keeps the in-memory "ready" + result-view Save fallback.
     if (FIREBASE_READY && currentUser) {
       wasBulk = isBulkMode();
-      // Re-read in case the user tapped "Scan next" while identify was running.
-      wasWaiting = QUEUE.waitingJobId === job.id;
       try {
         const cardId = await persistPendingCard(job);
         if (!QUEUE.jobs.includes(job)) return; // discarded mid-upload
         persistedCardId = cardId;
         outcome = "persisted";
+        // Read the "user is waiting on this one" flag as LATE as possible —
+        // right before removeJob() clears it. Reading it earlier is a race: when
+        // identify is skipped (AI known-down) there's no await before this point,
+        // so runJob would check the flag before showSingleProcessing() has set
+        // it, and the scan would sit on "Identifying…" instead of opening.
+        wasWaiting = QUEUE.waitingJobId === job.id;
         // It now lives in Firestore; drop it from the in-memory queue.
         removeJob(job.id);
       } catch (perr) {
@@ -1236,6 +1248,68 @@ function updateReviewSurfaces() {
       el.innerHTML = "";
     }
   });
+}
+
+// --- AI outage banner -------------------------------------------------------
+// The Cloud Functions tag billing / rate-limit / overload failures with a
+// machine-readable details.reason. Without this, an empty Anthropic credit
+// balance was indistinguishable from a blurry photo: every scan silently
+// became "Unidentified card" (40 in a row on 2026-07-19) and the user was left
+// thinking the AI couldn't read their cards. Name the real cause, once, loudly.
+let aiOutage = null; // { reason, message } | null
+
+// Firebase callable errors expose the server's HttpsError details verbatim.
+function aiOutageFrom(err) {
+  const reason = err && err.details && err.details.reason;
+  if (reason === "no_credits" || reason === "bad_key" || reason === "rate_limited" || reason === "overloaded") {
+    return { reason, message: (err && err.message) || "The AI is unavailable right now." };
+  }
+  return null;
+}
+
+// True when the API is known-dead for every request (not just this one), so
+// there's no point spending more calls or daily quota on it.
+function aiHardDown() {
+  return !!aiOutage && (aiOutage.reason === "no_credits" || aiOutage.reason === "bad_key");
+}
+
+function setAiOutage(outage) {
+  if (!outage) return;
+  aiOutage = outage;
+  renderAiOutageBanner();
+}
+
+function clearAiOutage() {
+  if (!aiOutage) return;
+  aiOutage = null;
+  renderAiOutageBanner();
+}
+
+function renderAiOutageBanner() {
+  const root = document.getElementById("view-root");
+  let el = document.getElementById("ai-outage-banner");
+  if (!aiOutage || !root) {
+    if (el) el.remove();
+    return;
+  }
+  if (!el) {
+    el = document.createElement("div");
+    el.id = "ai-outage-banner";
+    el.className = "ai-outage-banner";
+    el.setAttribute("role", "status");
+    root.insertBefore(el, root.firstChild);
+  }
+  const heading = aiHardDown() ? "Scanning is paused" : "The AI is busy right now";
+  el.innerHTML = `
+    <p class="ai-outage-title">${esc(heading)}</p>
+    <p>${esc(aiOutage.message)}</p>
+    <p class="muted">Your photos are safe. Every scan is saved in
+      <a href="#/review">Needs review</a> — once this is sorted, open it and tap
+      <strong>Identify all with AI</strong> to finish them in one go.</p>
+    <button type="button" id="ai-outage-dismiss" class="control-btn">Dismiss</button>
+  `;
+  const dismiss = document.getElementById("ai-outage-dismiss");
+  if (dismiss) dismiss.addEventListener("click", clearAiOutage);
 }
 
 if (bulkToggleEl) {
@@ -2824,10 +2898,92 @@ async function renderReview() {
     })
     .join("");
 
+  // Cards saved without an identification (AI was down, or couldn't read them)
+  // can all be retried from here — one tap instead of opening each card.
+  const needsId = pend.filter((c) => isUnidentified(c)).map((c) => c.id);
+
   reviewContentEl.innerHTML = `
     <p class="review-count">${pend.length} card${pend.length === 1 ? "" : "s"} to review</p>
+    ${
+      needsId.length
+        ? `<div class="bulk-identify">
+             <button type="button" id="review-identify-all" class="big-button primary">
+               <span aria-hidden="true">✦</span> Identify all ${needsId.length} with AI
+             </button>
+             <p id="review-bulk-status" class="status" aria-live="polite"></p>
+           </div>`
+        : ""
+    }
     <div class="review-list">${items}</div>
   `;
+
+  const allBtn = document.getElementById("review-identify-all");
+  if (allBtn) allBtn.addEventListener("click", () => identifyAllPending(needsId));
+}
+
+// Re-run identification on every pending card that has no identification yet.
+// Runs a few at a time (the server caps concurrency and daily quota anyway) and
+// stops immediately if the AI turns out to be down, so a dead API can't chew
+// through the whole pile — and the user's daily quota — one failure at a time.
+async function identifyAllPending(ids) {
+  const btn = document.getElementById("review-identify-all");
+  const statusEl = document.getElementById("review-bulk-status");
+  if (!ids.length || !btn) return;
+
+  const origLabel = btn.innerHTML;
+  btn.disabled = true;
+  let next = 0, done = 0, failed = 0, halted = false;
+
+  const paint = () => {
+    if (statusEl) {
+      statusEl.textContent = `Identifying… ${done + failed} of ${ids.length} done` +
+        (failed ? ` (${failed} couldn't be read)` : "");
+    }
+  };
+  paint();
+
+  async function worker() {
+    while (!halted) {
+      const i = next++;
+      if (i >= ids.length) return;
+      try {
+        await identifyStoredCard(ids[i]);
+        done++;
+      } catch (err) {
+        const outage = aiOutageFrom(err);
+        if (outage) {
+          // Whole-service failure — stop the run rather than repeating it.
+          halted = true;
+          setAiOutage(outage);
+          return;
+        }
+        console.warn("Bulk identify failed for", ids[i], err);
+        failed++;
+      }
+      paint();
+    }
+  }
+
+  // Three at a time mirrors the scan queue's concurrency cap.
+  await Promise.all([worker(), worker(), worker()]);
+
+  btn.disabled = false;
+  btn.innerHTML = origLabel;
+
+  if (halted) {
+    if (statusEl) {
+      statusEl.textContent = `Stopped after ${done} of ${ids.length}. ${aiOutage ? aiOutage.message : ""}`;
+    }
+    return;
+  }
+  showToast(
+    failed
+      ? `Identified ${done}. ${failed} still couldn't be read — edit those by hand.`
+      : `Identified all ${done}.`,
+    { variant: failed ? "info" : "success" },
+  );
+  // Reload so the rows show the new names instead of "Unidentified card".
+  await renderReview();
 }
 
 // Short meta line for a pending card in the review list.
@@ -2951,7 +3107,14 @@ async function retryIdentifyReviewedCard() {
     await identifyStoredCard(c.id);
   } catch (err) {
     console.error("Couldn't identify stored card", err);
-    showToast("Couldn't identify it just now. You can edit the details by hand and Keep it.", { variant: "error" });
+    const outage = aiOutageFrom(err);
+    setAiOutage(outage);
+    showToast(
+      outage
+        ? outage.message
+        : "Couldn't identify it just now. You can edit the details by hand and Keep it.",
+      { variant: "error" },
+    );
     if (aiBtn) { aiBtn.disabled = false; aiBtn.textContent = "✦ Identify with AI"; }
     return;
   }
@@ -3828,7 +3991,11 @@ document.addEventListener("click", async (e) => {
     if (statusEl) statusEl.textContent = "Done — edit it however you like.";
   } catch (err) {
     console.error("generateListing failed", err);
-    if (statusEl) statusEl.textContent = "Couldn't write one just now. Try again.";
+    const outage = aiOutageFrom(err);
+    setAiOutage(outage);
+    if (statusEl) {
+      statusEl.textContent = outage ? outage.message : "Couldn't write one just now. Try again.";
+    }
   } finally {
     btn.disabled = false;
     btn.textContent = orig;
