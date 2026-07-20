@@ -1589,12 +1589,14 @@ function valueBlockHTML(v) {
   if (!v || (typeof v.low !== "number" && typeof v.high !== "number")) return "";
   // Say where the number came from. A real market price and the model's
   // recollection are very different things and shouldn't look identical.
+  const SOURCE_LABELS = {
+    sportscardspro: "Market price (SportsCardsPro)",
+    ebay_sold: "Based on eBay sold prices",
+  };
+  const sourced = !v.userEdited && !!SOURCE_LABELS[v.source];
   const label = v.userEdited
     ? "Your estimate"
-    : v.source === "sportscardspro"
-      ? "Market price (SportsCardsPro)"
-      : "Claude AI ballpark";
-  const sourced = !v.userEdited && v.source === "sportscardspro";
+    : SOURCE_LABELS[v.source] || "Claude AI ballpark";
   return `
     <div class="value-block${sourced ? " sourced" : ""}">
       <div class="label muted">${esc(label)}</div>

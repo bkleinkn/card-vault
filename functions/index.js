@@ -20,6 +20,12 @@ const ANTHROPIC_API_KEY = defineSecret("ANTHROPIC_API_KEY");
 //   firebase functions:secrets:set SPORTSCARDSPRO_TOKEN --project=card-vault-d8fa4
 //   firebase deploy --only functions --project=card-vault-d8fa4
 const SPORTSCARDSPRO_TOKEN = defineSecret("SPORTSCARDSPRO_TOKEN");
+// Optional. A scraping-proxy URL template containing the literal placeholder
+// {url}, e.g. "https://api.scraperapi.com/?api_key=KEY&url={url}". eBay returns
+// 403 to Cloud Function IPs, so without this the sold-price lookup can never
+// succeed. Provider-agnostic on purpose: switching services is a secret change,
+// not a code change. Unset (or "UNSET") ⇒ requests go direct, as before.
+const EBAY_PROXY_TEMPLATE = defineSecret("EBAY_PROXY_TEMPLATE");
 
 // --- Identify prompts & schemas --------------------------------------------
 // Three item types share one Cloud Function. Each gets its own frozen system
@@ -290,7 +296,7 @@ exports.identifyCard = onCall(
   // timeoutSeconds bumped above the 60s default because we also await a price
   // lookup after the model call.
   {
-    secrets: [ANTHROPIC_API_KEY, SPORTSCARDSPRO_TOKEN],
+    secrets: [ANTHROPIC_API_KEY, SPORTSCARDSPRO_TOKEN, EBAY_PROXY_TEMPLATE],
     cors: true,
     region: "us-central1",
     timeoutSeconds: 120,
@@ -420,7 +426,22 @@ async function identifyImages(frontImageBase64, backImageBase64, type) {
         source: "sportscardspro",
       };
     } else if (!scpToken()) {
-      parsed.ebayPrices = await fetchEbaySoldPrices(query);
+      const ebay = await fetchEbaySoldPrices(query);
+      parsed.ebayPrices = ebay;
+      // Real sold prices beat the model's recollection. Require a few comps —
+      // one or two are noise, and eBay results mix in graded copies, lots, and
+      // near-miss variants, so the median is an approximation, not a quote.
+      if (ebay && ebay.count >= 3 && ebay.median > 0) {
+        parsed.valueEstimate = {
+          low: Math.max(0.5, Math.round(ebay.median * 70) / 100),
+          high: Math.round(ebay.median * 130) / 100,
+          note:
+            `Based on ${ebay.count} recent eBay sold listings ` +
+            `(median $${ebay.median.toFixed(2)}). Check the listings yourself for condition.`,
+          estimatedAt: new Date().toISOString(),
+          source: "ebay_sold",
+        };
+      }
     }
   }
 
@@ -437,7 +458,7 @@ async function identifyImages(frontImageBase64, backImageBase64, type) {
 // org-parented project (roles/datastore.user + roles/storage.objectViewer).
 exports.identifyStored = onCall(
   {
-    secrets: [ANTHROPIC_API_KEY, SPORTSCARDSPRO_TOKEN],
+    secrets: [ANTHROPIC_API_KEY, SPORTSCARDSPRO_TOKEN, EBAY_PROXY_TEMPLATE],
     cors: true,
     region: "us-central1",
     timeoutSeconds: 120,
@@ -744,14 +765,39 @@ function parseEbaySoldHtml(html, maxResults = 60) {
 // Scrape eBay's sold-listings page for the given free-text query and return
 // median / min / max / count, or null on any failure. User-Agent mimics a real
 // browser because eBay returns an empty body to the default Node fetch UA.
-async function fetchEbaySoldPrices(query, maxResults = 60) {
-  const url = `https://www.ebay.com/sch/i.html?_nkw=${encodeURIComponent(query)}&LH_Sold=1&LH_Complete=1&_ipg=${maxResults}`;
-  // Abort a slow eBay response so it can't hang the function and discard an
-  // otherwise-successful identification.
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 6000);
+// The configured scraping-proxy template, or null when going direct.
+function ebayProxyTemplate() {
+  let t = "";
   try {
-    const response = await fetch(url, {
+    t = (EBAY_PROXY_TEMPLATE.value() || "").trim();
+  } catch {
+    return null; // secret not available in this context
+  }
+  if (!t || /^unset$/i.test(t)) return null;
+  if (!t.includes("{url}")) {
+    console.warn("EBAY_PROXY_TEMPLATE is set but has no {url} placeholder — ignoring it.");
+    return null;
+  }
+  return t;
+}
+
+async function fetchEbaySoldPrices(query, maxResults = 60) {
+  // The real eBay URL. This is what gets STORED and shown to the user — never
+  // the proxied one, which carries the provider's API key in its query string.
+  const searchUrl = `https://www.ebay.com/sch/i.html?_nkw=${encodeURIComponent(query)}&LH_Sold=1&LH_Complete=1&_ipg=${maxResults}`;
+
+  const template = ebayProxyTemplate();
+  const requestUrl = template
+    ? template.replace("{url}", encodeURIComponent(searchUrl))
+    : searchUrl;
+
+  // Abort a slow response so it can't hang the function and discard an
+  // otherwise-successful identification. Proxies add a real round trip (they
+  // fetch the page for us), so they need a much longer leash than a direct hit.
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), template ? 25000 : 6000);
+  try {
+    const response = await fetch(requestUrl, {
       signal: controller.signal,
       headers: {
         "User-Agent":
@@ -761,20 +807,24 @@ async function fetchEbaySoldPrices(query, maxResults = 60) {
       },
     });
     if (!response.ok) {
-      console.warn(`eBay fetch returned ${response.status} for query "${query}"`);
+      // Log the status and whether we were proxied — never requestUrl itself.
+      console.warn(
+        `eBay fetch returned ${response.status} for query "${query}"` +
+          (template ? " (via proxy)" : " (direct)"),
+      );
       return null;
     }
     const html = await response.text();
 
     const stats = parseEbaySoldHtml(html, maxResults);
     if (stats.count === 0) {
-      return { query, count: 0, searchUrl: url };
+      return { query, count: 0, searchUrl };
     }
 
     return {
       ...stats,
       query,
-      searchUrl: url,
+      searchUrl,
       fetchedAt: new Date().toISOString(),
     };
   } catch (err) {

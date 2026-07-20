@@ -57,6 +57,10 @@ If a feature requires collector jargon to use, it doesn't belong in v1.
 
 ⚠️ **Unverified:** the grade-tier field mapping (`graded-price` → grade 9, `manual-only-price` → PSA 10) is inferred from PriceCharting's legacy schema and has never seen a real response. `loose-price` → ungraded is the one that matters and is well attested. `fetchMarketPrice` logs the full key set on every success — check those logs against a real card before trusting the graded tiers.
 
+**Proxy route (chosen as the budget path).** `fetchEbaySoldPrices` sends its request through the optional `EBAY_PROXY_TEMPLATE` secret — a provider-agnostic URL template containing the literal `{url}` placeholder, e.g. `https://api.scraperapi.com/?api_key=KEY&url={url}`. Switching providers is a secret change, not a code change. Unset (or `UNSET`) ⇒ direct request, which always 403s; logs say `(direct)` vs `(via proxy)` so the mode is visible. The proxied URL carries the provider API key, so it is never logged and never stored — `ebayPrices.searchUrl` is always the real eBay URL. Timeout is 25s when proxied (the provider fetches the page for us) vs 6s direct. With ≥3 comps the median anchors `valueEstimate` (`source: "ebay_sold"`, ±30% band, labelled "Based on eBay sold prices"). ⚠️ Untested end-to-end — no proxy account exists yet; the direct/inert path is verified.
+
+⚠️ Scraping via a proxy deliberately works around eBay's bot protection and is against their ToS. Fine-ish at one-request-per-scan personal volume, but it can break at any time and is not a foundation to build on.
+
 Other options considered:
 
 - **eBay Marketplace Insights API** — 90 days of sold data, but requires approval (slow)
@@ -218,6 +222,7 @@ card-vault/
 - **GitHub:** [github.com/bkleinkn/card-vault](https://github.com/bkleinkn/card-vault)
 - **Per-scan cost:** ~$0.01–0.03 (Claude Opus 4.8 with prompt-caching kicking in after the first scan). `generateListing` (AI eBay descriptions) also uses Opus 4.8 with web search.
 - **Secret rotation:** if `ANTHROPIC_API_KEY` ever needs swapping, run `firebase functions:secrets:set ANTHROPIC_API_KEY --project=card-vault-d8fa4` then `firebase deploy --only functions --project=card-vault-d8fa4`.
+- **Turning on eBay sold comps (proxy):** sign up for any scraping-proxy service, then `firebase functions:secrets:set EBAY_PROXY_TEMPLATE --project=card-vault-d8fa4` with a template like `https://api.scraperapi.com/?api_key=YOURKEY&url={url}` (the `{url}` placeholder is required), and `firebase deploy --only functions --project=card-vault-d8fa4`. Confirm with `gcloud logging read '... textPayload:eBay'` — success stops logging 403 and the mode flips from `(direct)` to `(via proxy)`.
 - **Turning on real market prices:** subscribe to [SportsCardsPro](https://www.sportscardspro.com/) (Legendary tier, ~$6/mo — API access is included), copy the 40-character token from the account page, then `firebase functions:secrets:set SPORTSCARDSPRO_TOKEN --project=card-vault-d8fa4` and `firebase deploy --only functions --project=card-vault-d8fa4`. Verify with `gcloud logging read '... textPayload:SportsCardsPro'` — a successful lookup logs the response's field names. To turn it back off, set the secret to `UNSET` and redeploy.
 - **USE_MOCK_AI escape hatch:** Flip `const USE_MOCK_AI = true;` in `public/app.js` to temporarily revert all scans to the mocked 1956 Mantle without redeploying the function (useful for cost-free UX iteration). Then `firebase deploy --only hosting`.
 - **Cross-PC dev:** `git clone https://github.com/bkleinkn/card-vault.git && cd card-vault && npm install && cd functions && npm install`. Firebase deploys from any machine work after `firebase login` (as bkleinkn@gmail.com) — secrets stay server-side.
