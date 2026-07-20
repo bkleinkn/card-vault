@@ -965,9 +965,9 @@ async function persistPendingCard(job) {
   const result = job.result || {};
   // "Needs identifying" when there's no real identification to show — either the
   // identify call failed (result is null) or the model couldn't read the item.
-  const needsIdentify = !(
-    result && result.identified && (result.identified.player || result.identified.itemLabel)
-  );
+  // Shared with the review UI so a card can't be un-retryable in one place and
+  // flagged in the other.
+  const needsIdentify = isUnidentified({ identified: result.identified || {} });
   await setDoc(doc(db, "users", currentUser.uid, "cards", cardId), {
     createdAt: serverTimestamp(),
     status: "pending",
@@ -1532,7 +1532,17 @@ function isUnidentified(data) {
   if (!data) return true;
   if (data.needsIdentify) return true;
   const id = data.identified || {};
-  return !id.player && !id.itemLabel;
+  const name = (id.player || id.itemLabel || "").trim();
+  if (!name) return true;
+  // A hand-typed name is the user's call — always trust it.
+  if (id.userEdited) return false;
+  // The identify prompts tell the model to answer "Unknown card" / "Unknown
+  // pack" / "Unknown box" (confidence 0) when it can't read the item, so a
+  // name is NOT proof of an identification. Without this the model's own
+  // "I couldn't read this" sentinel counted as success: the card showed as
+  // "Unknown card" with no way to retry it, and "Identify all with AI"
+  // skipped exactly the cards that most needed another pass.
+  return /^unknown\b/i.test(name);
 }
 
 // Small secondary line under each collection tile.
@@ -2932,12 +2942,14 @@ async function identifyAllPending(ids) {
 
   const origLabel = btn.innerHTML;
   btn.disabled = true;
-  let next = 0, done = 0, failed = 0, halted = false;
+  // ok = now has a real name; unreadable = the AI ran but still couldn't read
+  // it; failed = the call itself errored. Kept apart so the summary can't claim
+  // it identified a card that still says "Unknown".
+  let next = 0, ok = 0, unreadable = 0, failed = 0, halted = false;
 
   const paint = () => {
     if (statusEl) {
-      statusEl.textContent = `Identifying… ${done + failed} of ${ids.length} done` +
-        (failed ? ` (${failed} couldn't be read)` : "");
+      statusEl.textContent = `Identifying… ${ok + unreadable + failed} of ${ids.length} done`;
     }
   };
   paint();
@@ -2947,8 +2959,9 @@ async function identifyAllPending(ids) {
       const i = next++;
       if (i >= ids.length) return;
       try {
-        await identifyStoredCard(ids[i]);
-        done++;
+        const res = await identifyStoredCard(ids[i]);
+        if (isUnidentified({ identified: (res && res.identified) || {} })) unreadable++;
+        else ok++;
       } catch (err) {
         const outage = aiOutageFrom(err);
         if (outage) {
@@ -2972,15 +2985,17 @@ async function identifyAllPending(ids) {
 
   if (halted) {
     if (statusEl) {
-      statusEl.textContent = `Stopped after ${done} of ${ids.length}. ${aiOutage ? aiOutage.message : ""}`;
+      statusEl.textContent =
+        `Stopped after ${ok} of ${ids.length}. ${aiOutage ? aiOutage.message : ""}`;
     }
     return;
   }
+  const leftover = unreadable + failed;
   showToast(
-    failed
-      ? `Identified ${done}. ${failed} still couldn't be read — edit those by hand.`
-      : `Identified all ${done}.`,
-    { variant: failed ? "info" : "success" },
+    leftover
+      ? `Identified ${ok}. ${leftover} still couldn't be read — try a clearer photo, or type the details in by hand.`
+      : `Identified all ${ok}.`,
+    { variant: leftover ? "info" : "success" },
   );
   // Reload so the rows show the new names instead of "Unidentified card".
   await renderReview();
@@ -3188,7 +3203,7 @@ function renderReviewEditing() {
       identified: editedIdentified,
       valueEstimate: readEditedValueEstimate(c.valueEstimate),
       // Once the user has hand-entered a name/label, it's no longer "unidentified".
-      needsIdentify: !(editedIdentified.player || editedIdentified.itemLabel),
+      needsIdentify: isUnidentified({ identified: editedIdentified }),
       userNotes: document.getElementById("review-notes").value || null,
       locationId: document.getElementById("review-location").value || null,
     };
