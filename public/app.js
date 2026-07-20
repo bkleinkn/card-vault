@@ -649,8 +649,13 @@ async function startScanCamera() {
     return;
   }
   cameraVideo.srcObject = cameraStream;
-  try { await cameraVideo.play(); } catch (_) { /* autoplay attribute usually covers it */ }
   exitBackStep();                     // a fresh camera always starts on the front
+
+  // Reveal the stage BEFORE starting playback. iOS Safari will not start a
+  // video inside a display:none container: play() can return a promise that
+  // never settles, so awaiting it here left the UI frozen right after the user
+  // granted camera permission — prompt accepted, then nothing. Chrome settles
+  // it immediately, which is why Android was unaffected.
   cameraStage.hidden = false;
   captureNowBtn.hidden = false;
   cameraFallback.hidden = false;      // keep the escape hatch reachable, collapsed
@@ -660,9 +665,35 @@ async function startScanCamera() {
       ? `Bulk mode — capture the front of the first ${itemNoun(state.itemType)}.`
       : `Fill the frame with the front of the ${itemNoun(state.itemType)}, then tap Capture`,
   );
+
+  // Fire-and-forget: the element is autoplay + muted + playsinline, so iOS
+  // starts it on its own once visible. Never await this — a hung promise must
+  // not be able to block the interface again.
+  Promise.resolve(cameraVideo.play()).catch(() => {});
+  watchCameraFrames();
+}
+
+// Safety net: a camera that opens but produces no frames should say so rather
+// than leaving the user staring at a blank box. Covers the iOS case above, a
+// camera held by another app, and a track the OS kills at startup.
+let frameWatchdog = null;
+function watchCameraFrames() {
+  clearTimeout(frameWatchdog);
+  frameWatchdog = setTimeout(() => {
+    if (!cameraStream || cameraVideo.videoWidth > 0) return; // frames flowing
+    console.warn("Camera opened but produced no frames after 6s.");
+    stopScanCamera();
+    enableCameraBtn.hidden = false;
+    enableCameraBtn.textContent = "Try camera again";
+    showCameraFallback(
+      "The camera didn't start. Close any other app that might be using it and " +
+        "tap “Try camera again,” or upload a photo instead.",
+    );
+  }, 6000);
 }
 
 function stopScanCamera() {
+  clearTimeout(frameWatchdog);
   // Camera closing mid back-step (tab hidden, navigation away): don't lose the
   // captured front — queue it front-only, since the back can't be taken now.
   if (pendingFront) {
