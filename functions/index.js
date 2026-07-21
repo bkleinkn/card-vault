@@ -943,9 +943,12 @@ function parseEbaySoldHtml(html, want = {}, maxResults = 60) {
     if (wantYear && !title.includes(wantYear)) continue;
 
     const raw = m[1].trim();
-    // A letter before the "$" means a foreign currency (C $, AU $, MX $).
-    if (/[A-Za-z]\s*\$/.test(raw)) continue;
-    // Multi-variant listings render "$10.00 to $50.00" — take the low end.
+    // A letter BEFORE the first "$" means a foreign currency (C $, AU $, MX $).
+    // Only the prefix is checked: multi-variant listings render "$10.00 to
+    // $50.00", and the "to" is not a currency marker.
+    const firstDollar = raw.indexOf("$");
+    if (/[A-Za-z]/.test(firstDollar >= 0 ? raw.slice(0, firstDollar) : raw)) continue;
+    // For a range, take the low end.
     const num = raw.match(/\$([\d,]+(?:\.\d{1,2})?)/);
     if (!num) continue;
     const value = parseFloat(num[1].replace(/,/g, ""));
@@ -1205,4 +1208,9 @@ exports.onCardDeleted = onDocumentDeleted(
 );
 
 // Exposed for unit tests (pure helpers; no side effects).
-module.exports.__testables = { promptAndSchema, parseEbaySoldHtml };
+module.exports.__testables = {
+  promptAndSchema,
+  parseEbaySoldHtml,
+  buildPriceQuery,
+  buildRelevance,
+};
