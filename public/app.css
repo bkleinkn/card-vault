@@ -2327,10 +2327,19 @@ body.cv-viewer-open { overflow: hidden; }
   pointer-events: none;     /* never blocks pan — chips re-enable below */
 }
 
+/* The bar is click-through so a pan gesture over it still reaches the photo,
+   but every CONTROL inside it must take pointer events back. Keyed on the
+   element rather than one class: the Rotate button shipped as a direct child
+   of the bar and was completely unclickable (2026-07-21) — clicks fell through
+   to the stage, which showed its zoom cursor as the only clue. */
+.cv-viewer-bar button,
+.cv-viewer-sides {
+  pointer-events: auto;
+}
+
 .cv-viewer-sides {
   display: flex;
   gap: 8px;
-  pointer-events: auto;
 }
 
 .cv-viewer-side {

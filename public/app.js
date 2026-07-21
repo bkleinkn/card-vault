@@ -67,7 +67,7 @@ const PRICE_ALGO = 2;
 // Deploy stamp, written by scripts/stamp-version.mjs (hosting predeploy hook).
 // Compared against the page's <meta name="cv-build"> and the server's
 // version.json to detect stale installs — see enforceVersionSync().
-const BUILD = "20260721-190040-48a3a7d";
+const BUILD = "20260721-190432-89b6d90";
 
 let auth, db, storage, functions, currentUser;
 
