@@ -394,61 +394,86 @@ async function identifyImages(frontImageBase64, backImageBase64, type) {
     parsed.valueEstimate.estimatedAt = new Date().toISOString();
   }
 
-  // Real recent eBay sold prices as a second source. Query differs by type.
-  const ident = parsed.identified || {};
-  let queryParts;
+  // Real recent sold prices as a second source, replacing the model's guess.
+  const query = buildPriceQuery(parsed.identified, type);
+  if (query) {
+    const prices = await lookupPrices(query);
+    if (prices.marketPrice) parsed.marketPrice = prices.marketPrice;
+    if (prices.triedEbay) parsed.ebayPrices = prices.ebayPrices;
+    if (prices.valueEstimate) parsed.valueEstimate = prices.valueEstimate;
+  }
+
+  return parsed;
+}
+
+// The free-text search that stands in for "this exact item" at the price
+// sources. Null when the item isn't identified well enough to search for —
+// pricing "Unknown card" would return a meaningless median.
+function buildPriceQuery(identified, type) {
+  const ident = identified || {};
+  let parts;
   if (type === "card") {
-    queryParts = ident.player && ident.player !== "Unknown card"
+    parts = ident.player && !/^unknown/i.test(ident.player)
       ? [ident.year, ident.set, ident.player, ident.cardNumber]
       : null;
   } else {
     const known = ident.itemLabel && !/^unknown/i.test(ident.itemLabel);
-    queryParts = known ? [ident.year, ident.set, ident.itemLabel, "sealed"] : null;
+    parts = known ? [ident.year, ident.set, ident.itemLabel, "sealed"] : null;
   }
-  if (queryParts) {
-    const query = queryParts.filter(Boolean).join(" ");
+  if (!parts) return null;
+  const query = parts.filter(Boolean).join(" ");
+  return query.trim() ? query : null;
+}
 
-    // Prefer a real market price. Only fall back to the eBay scrape when no
-    // SportsCardsPro token is configured — with one, the scrape is a guaranteed
-    // 403 and pure latency.
-    const market = await fetchMarketPrice(query);
-    if (market) {
-      parsed.marketPrice = market;
-      // Anchor the headline estimate to observed prices instead of the model's
-      // recollection. A modest band around the ungraded figure keeps it honest
-      // about being approximate; the note names the source and the exact
-      // number so it can be sanity-checked against the site.
-      parsed.valueEstimate = {
-        low: Math.max(0.5, Math.round(market.ungraded * 75) / 100),
-        high: Math.round(market.ungraded * 125) / 100,
-        note: `Based on the SportsCardsPro ungraded market price ($${market.ungraded.toFixed(2)}).`,
-        estimatedAt: new Date().toISOString(),
-        source: "sportscardspro",
-      };
-    } else if (!scpToken()) {
-      const ebay = await fetchEbaySoldPrices(query);
-      parsed.ebayPrices = ebay;
-      // Real sold prices beat the model's recollection. Require a few comps —
-      // one or two are noise, and eBay results mix in graded copies, lots, and
-      // near-miss variants, so the median is an approximation, not a quote.
-      if (ebay && ebay.count >= 3 && ebay.median > 0) {
-        // Whole dollars — a ±30% band is an approximation, and "$836.5" reads
-        // as broken precision to the person deciding whether to keep the card.
-        parsed.valueEstimate = {
-          low: Math.max(1, Math.round(ebay.median * 0.7)),
-          high: Math.max(1, Math.round(ebay.median * 1.3)),
-          note:
-            `Based on ${ebay.count} recent eBay sold listings ` +
-            `(median $${ebay.median.toLocaleString("en-US", { maximumFractionDigits: 2 })}). ` +
-            `Check the listings yourself for condition.`,
-          estimatedAt: new Date().toISOString(),
-          source: "ebay_sold",
-        };
-      }
-    }
+// Price an already-identified item. Returns { marketPrice, ebayPrices,
+// valueEstimate, triedEbay } — any of the first three null when that source had
+// nothing to say. No model call, so this is free apart from the proxy request:
+// identifyImages uses it on fresh scans, refreshPrices re-runs it later.
+async function lookupPrices(query) {
+  const out = { marketPrice: null, ebayPrices: null, valueEstimate: null, triedEbay: false };
+
+  // Prefer a real market price. Only fall back to the eBay scrape when no
+  // SportsCardsPro token is configured — with one, the scrape is a guaranteed
+  // 403 and pure latency.
+  const market = await fetchMarketPrice(query);
+  if (market) {
+    out.marketPrice = market;
+    // Anchor the headline estimate to observed prices instead of the model's
+    // recollection. A modest band around the ungraded figure keeps it honest
+    // about being approximate; the note names the source and the exact
+    // number so it can be sanity-checked against the site.
+    out.valueEstimate = {
+      low: Math.max(0.5, Math.round(market.ungraded * 75) / 100),
+      high: Math.round(market.ungraded * 125) / 100,
+      note: `Based on the SportsCardsPro ungraded market price ($${market.ungraded.toFixed(2)}).`,
+      estimatedAt: new Date().toISOString(),
+      source: "sportscardspro",
+    };
+    return out;
   }
+  if (scpToken()) return out;
 
-  return parsed;
+  out.triedEbay = true;
+  const ebay = await fetchEbaySoldPrices(query);
+  out.ebayPrices = ebay;
+  // Real sold prices beat the model's recollection. Require a few comps —
+  // one or two are noise, and eBay results mix in graded copies, lots, and
+  // near-miss variants, so the median is an approximation, not a quote.
+  if (ebay && ebay.count >= 3 && ebay.median > 0) {
+    // Whole dollars — a ±30% band is an approximation, and "$836.5" reads
+    // as broken precision to the person deciding whether to keep the card.
+    out.valueEstimate = {
+      low: Math.max(1, Math.round(ebay.median * 0.7)),
+      high: Math.max(1, Math.round(ebay.median * 1.3)),
+      note:
+        `Based on ${ebay.count} recent eBay sold listings ` +
+        `(median $${ebay.median.toLocaleString("en-US", { maximumFractionDigits: 2 })}). ` +
+        `Check the listings yourself for condition.`,
+      estimatedAt: new Date().toISOString(),
+      source: "ebay_sold",
+    };
+  }
+  return out;
 }
 
 // Re-run identification on a card already saved to Firestore (the "needs
@@ -524,6 +549,82 @@ exports.identifyStored = onCall(
       if (err instanceof HttpsError) throw err;
       console.error(`identifyStored failed for ${uid}/${cardId}:`, err);
       throw new HttpsError("internal", "Could not identify that card. Try again.");
+    }
+  },
+);
+
+// Re-price a card that's already identified, WITHOUT re-running the model: it
+// searches the price sources using the identification already on the doc. This
+// is the repair path for everything scanned while the eBay lookup was silently
+// 403ing (i.e. every card scanned before 2026-07-21), and the way to refresh a
+// stale price later. No Anthropic call, so the only cost is one proxy request.
+//
+// A hand-typed valueEstimate (userEdited) is never overwritten — the comps are
+// still stored so the user can see them next to their own number.
+exports.refreshPrices = onCall(
+  {
+    secrets: [SPORTSCARDSPRO_TOKEN, EBAY_PROXY_TEMPLATE],
+    cors: true,
+    region: "us-central1",
+    timeoutSeconds: 120,
+  },
+  async (request) => {
+    if (!request.auth) {
+      throw new HttpsError("unauthenticated", "Sign in required.");
+    }
+    const uid = request.auth.uid;
+    const cardId = request.data && request.data.cardId;
+    if (typeof cardId !== "string" || cardId.trim() === "") {
+      throw new HttpsError("invalid-argument", "A cardId is required.");
+    }
+
+    // Its own quota bucket: these calls are far cheaper than identifications,
+    // and re-pricing a big collection shouldn't eat the scanning allowance.
+    await enforceDailyQuota(uid, "prices", 1000);
+
+    try {
+      const db = admin.firestore();
+      const ref = db.doc(`users/${uid}/cards/${cardId}`);
+      const snap = await ref.get();
+      if (!snap.exists) {
+        throw new HttpsError("not-found", "That card no longer exists.");
+      }
+      const card = snap.data() || {};
+      const type = card.itemType === "pack" || card.itemType === "box" ? card.itemType : "card";
+
+      const query = buildPriceQuery(card.identified, type);
+      if (!query) {
+        throw new HttpsError(
+          "failed-precondition",
+          "This card needs identifying before it can be priced.",
+        );
+      }
+
+      const prices = await lookupPrices(query);
+
+      const update = { pricesRefreshedAt: new Date().toISOString() };
+      if (prices.marketPrice) update.marketPrice = prices.marketPrice;
+      if (prices.triedEbay) update.ebayPrices = prices.ebayPrices;
+
+      const userEdited = !!(card.valueEstimate && card.valueEstimate.userEdited);
+      const replaced = !!prices.valueEstimate && !userEdited;
+      if (replaced) update.valueEstimate = prices.valueEstimate;
+
+      await ref.set(update, { merge: true });
+
+      return {
+        query,
+        replaced,
+        keptUserEstimate: userEdited && !!prices.valueEstimate,
+        compCount: (prices.ebayPrices && prices.ebayPrices.count) || 0,
+        valueEstimate: update.valueEstimate || card.valueEstimate || null,
+        ebayPrices: update.ebayPrices || card.ebayPrices || null,
+        marketPrice: update.marketPrice || card.marketPrice || null,
+      };
+    } catch (err) {
+      if (err instanceof HttpsError) throw err;
+      console.error(`refreshPrices failed for ${uid}/${cardId}:`, err);
+      throw new HttpsError("internal", "Could not refresh that price. Try again.");
     }
   },
 );

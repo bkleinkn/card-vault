@@ -62,7 +62,7 @@ const USE_MOCK_AI = false;
 // Deploy stamp, written by scripts/stamp-version.mjs (hosting predeploy hook).
 // Compared against the page's <meta name="cv-build"> and the server's
 // version.json to detect stale installs — see enforceVersionSync().
-const BUILD = "20260721-161604-b4797cb";
+const BUILD = "20260721-163547-90919ba";
 
 let auth, db, storage, functions, currentUser;
 
@@ -1522,6 +1522,14 @@ async function identifyStoredCard(cardId) {
   return res.data;
 }
 
+// Look up real sold prices for a card that's already identified. No AI call —
+// the server searches using the identification already on the card.
+async function refreshCardPrices(cardId) {
+  const callable = httpsCallable(functions, "refreshPrices");
+  const res = await callable({ cardId });
+  return res.data;
+}
+
 async function mockIdentify(itemType = "card") {
   await new Promise((r) => setTimeout(r, 800));
   if (itemType === "pack") {
@@ -2130,7 +2138,20 @@ function drawCollection() {
        </div>`
     : "";
 
-  collectionListEl.innerHTML = sweepHTML + renderGroupedHTML(filtered);
+  // Cards whose value is still the AI's guess because the eBay lookup never
+  // actually worked. Also collection-wide, for the same reason.
+  const unpricedIds = IS_DEMO ? [] : cardsCache.filter(needsPriceRefresh).map((c) => c.id);
+  const priceSweepHTML = unpricedIds.length
+    ? `<div class="bulk-identify bulk-price">
+         <button type="button" id="collection-price-all" class="big-button">
+           <span aria-hidden="true">💲</span> Check real sold prices for ${unpricedIds.length} card${unpricedIds.length === 1 ? "" : "s"}
+         </button>
+         <p class="bulk-price-note">Looks each one up against recent eBay sold listings and replaces the AI's ballpark. Estimates usually come <strong>down</strong>.</p>
+         <p id="collection-price-status" class="status" aria-live="polite"></p>
+       </div>`
+    : "";
+
+  collectionListEl.innerHTML = sweepHTML + priceSweepHTML + renderGroupedHTML(filtered);
 
   const sweepBtn = document.getElementById("collection-identify-all");
   if (sweepBtn) {
@@ -2141,6 +2162,28 @@ function drawCollection() {
         refresh: renderCollection,
       }),
     );
+  }
+
+  const priceBtn = document.getElementById("collection-price-all");
+  if (priceBtn) {
+    priceBtn.addEventListener("click", async () => {
+      const many = unpricedIds.length;
+      const ok = await confirmDialog({
+        title: `Check sold prices for ${many} card${many === 1 ? "" : "s"}?`,
+        message:
+          `This looks up each card against recent eBay sold listings — about ` +
+          `${Math.max(1, Math.round((many * 12) / 60))} minute${Math.round((many * 12) / 60) === 1 ? "" : "s"}. ` +
+          `Keep this screen open while it runs. Your own hand-typed estimates are left alone.`,
+        confirmLabel: "Check prices",
+        cancelLabel: "Not now",
+      });
+      if (!ok) return;
+      await refreshAllPrices(unpricedIds, {
+        btnId: "collection-price-all",
+        statusId: "collection-price-status",
+        refresh: renderCollection,
+      });
+    });
   }
 }
 
@@ -2669,6 +2712,9 @@ function renderDetailDisplay(el) {
       ${renderEbayBlock(c.ebayPrices)}
       ${renderPriceLinks(c)}
     </div>
+    ${!IS_DEMO && !unidentified ? `
+      <div class="row"><button id="detail-price-btn" class="big-button"><span aria-hidden="true">💲</span> ${c.pricesRefreshedAt ? "Check sold prices again" : "Check real sold prices"}</button></div>
+    ` : ""}
     ${c.locationId && locationName(c.locationId) ? `<div class="location-display"><span aria-hidden="true">📍</span> <strong>Location:</strong> ${esc(locationName(c.locationId))}</div>` : ""}
     ${c.userNotes ? `<div class="notes-display">${esc(c.userNotes)}</div>` : ""}
     ${ebaySectionHTML(c)}
@@ -2705,6 +2751,35 @@ function renderDetailDisplay(el) {
         // Drop the cached copy so renderDetail re-reads the updated doc.
         detailState.cardId = null;
         detailState.card = null;
+        await renderDetail(cardId);
+      });
+    }
+    const priceBtn = document.getElementById("detail-price-btn");
+    if (priceBtn) {
+      priceBtn.addEventListener("click", async () => {
+        const cardId = detailState.cardId;
+        const origLabel = priceBtn.innerHTML;
+        priceBtn.disabled = true;
+        priceBtn.textContent = "Checking sold listings…";
+        let res = null;
+        try {
+          res = await refreshCardPrices(cardId);
+        } catch (err) {
+          console.error("Couldn't refresh prices", err);
+          showToast("Couldn't check prices just now. Try again in a minute.", { variant: "error" });
+          priceBtn.disabled = false;
+          priceBtn.innerHTML = origLabel;
+          return;
+        }
+        showToast(
+          res && res.keptUserEstimate
+            ? `Found ${res.compCount} sold listings — your own estimate was left as is.`
+            : res && res.replaced
+              ? `Priced from ${res.compCount} recent sold listings.`
+              : "No close sold listings found — keeping the AI estimate.",
+          { variant: res && (res.replaced || res.keptUserEstimate) ? "success" : "info" },
+        );
+        forgetCachedDetail();
         await renderDetail(cardId);
       });
     }
@@ -3189,8 +3264,101 @@ async function identifyAllPending(ids, ui) {
       : `Identified all ${ok}.`,
     { variant: leftover ? "info" : "success" },
   );
+  forgetCachedDetail();
   // Reload the launching view so rows show real names instead of "Unknown".
   await ui.refresh();
+}
+
+// True for a card that has never been priced against real sold listings. Every
+// card scanned before 2026-07-21 is in this state: the eBay lookup ran but was
+// silently 403ing, so its ebayPrices object has no comps and its value came
+// from the model's (high-skewed) recollection. pricesRefreshedAt is the marker
+// that a real lookup has since happened — even one that found nothing, so a
+// card with genuinely no comps doesn't get retried forever.
+function needsPriceRefresh(c) {
+  if (!c || c.pricesRefreshedAt) return false;
+  if (c.marketPrice) return false;
+  if (c.ebayPrices && c.ebayPrices.count >= 3) return false;
+  const id = c.identified || {};
+  const t = itemTypeOf(c);
+  const name = t === "card" ? id.player : id.itemLabel;
+  return !!name && !/^unknown/i.test(name);
+}
+
+// Re-price a batch of cards from real sold listings. Same shape as
+// identifyAllPending — three at a time, fresh element lookups because the view
+// re-renders mid-run — but there's no AI involved, so there's no outage to halt
+// on: a proxy hiccup on one card just leaves that card for the next run.
+let bulkPriceRunning = false;
+
+async function refreshAllPrices(ids, ui) {
+  if (!ids.length || bulkPriceRunning) return;
+  bulkPriceRunning = true;
+  const byId = (id) => document.getElementById(id);
+
+  const startBtn = byId(ui.btnId);
+  const origLabel = startBtn ? startBtn.innerHTML : "";
+  if (startBtn) startBtn.disabled = true;
+
+  // priced = comps found and the estimate now reflects them; noComps = the
+  // lookup worked but eBay had nothing comparable (common for commons);
+  // failed = the call itself errored.
+  let next = 0, priced = 0, noComps = 0, failed = 0;
+
+  const paint = () => {
+    const el = byId(ui.statusId);
+    if (el) {
+      el.textContent =
+        `Checking sold listings… ${priced + noComps + failed} of ${ids.length} done` +
+        (priced ? ` · ${priced} priced` : "");
+    }
+  };
+  paint();
+
+  async function worker() {
+    while (true) {
+      const i = next++;
+      if (i >= ids.length) return;
+      try {
+        const res = await refreshCardPrices(ids[i]);
+        if (res && (res.replaced || res.compCount >= 3)) priced++;
+        else noComps++;
+      } catch (err) {
+        console.warn("Price refresh failed for", ids[i], err);
+        failed++;
+      }
+      paint();
+    }
+  }
+
+  await Promise.all([worker(), worker(), worker()]);
+  bulkPriceRunning = false;
+
+  const endBtn = byId(ui.btnId);
+  if (endBtn) {
+    endBtn.disabled = false;
+    if (origLabel) endBtn.innerHTML = origLabel;
+  }
+
+  const leftover = noComps + failed;
+  showToast(
+    priced
+      ? `Priced ${priced} from real sold listings.` +
+        (leftover ? ` ${leftover} had no close matches — those keep their AI estimate.` : "")
+      : `No close sold listings found for these ${ids.length}. They keep their AI estimates.`,
+    { variant: priced ? "success" : "info" },
+  );
+  forgetCachedDetail();
+  await ui.refresh();
+}
+
+// The detail view keeps the last card it rendered in memory and reuses it when
+// you return to the same card. After a bulk run that copy is a pre-run
+// snapshot, so opening a card visited earlier in the session would show its old
+// price. Drop it; renderDetail then re-reads the doc.
+function forgetCachedDetail() {
+  detailState.cardId = null;
+  detailState.card = null;
 }
 
 // Short meta line for a pending card in the review list.

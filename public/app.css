@@ -2380,6 +2380,15 @@ img.card-photo,
   margin: 8px 0 0;
 }
 
+/* Price sweep sits under the identify sweep — same block, quieter button,
+   with a line of plain English about what it will do to the numbers. */
+.bulk-price-note {
+  margin: 8px 0 0;
+  font-size: 13px;
+  line-height: 1.5;
+  color: var(--ink-soft);
+}
+
 /* ---------- Front-then-back capture ----------
    After the front is captured, a small confirmation thumbnail pins to the
    corner of the live camera while the hint asks for the back of the card. */

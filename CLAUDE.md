@@ -65,6 +65,10 @@ Three hard-won specifics:
 - **Proxied timeout is 40s** (vs 6s direct). ScraperAPI latency swings from ~5s to 25s+ because it retries upstream blocks internally (their guidance: allow up to ~60s). The first live test aborted at the old 25s leash. 40s catches the slow tail while vision + lookup stays under the client SDK's 70s callable timeout; on abort the identification still succeeds, just without comps.
 - **Parser matches eBay's 2026 results markup**: prices live in `<span class="su-styled-text positive bold large-1 s-card__price">`. Only `positive` (green) spans are genuine SOLD prices — sponsored/active listings mixed into sold results render `primary` (black) and are deliberately excluded, since counting them would re-import exactly the asking-price skew this feature exists to escape. The legacy `s-item__price` pattern (which now matches nothing) is kept as a fallback in case eBay serves old templates to some sessions. If comps drop to 0 across the board someday, eBay probably shuffled markup again — fetch one page through the proxy and re-derive.
 
+**Re-pricing cards scanned before the fix (`refreshPrices`).** Every card scanned before 2026-07-21 carries an `ebayPrices` object with no comps and a value that came from the model's recollection, because the lookup was 403ing the whole time. `refreshPrices` (onCall) repairs them **without re-running the model**: it reads the identification already on the doc, rebuilds the search via the shared `buildPriceQuery()`, runs the shared `lookupPrices()` (SportsCardsPro → eBay, the same path fresh scans use), and writes `ebayPrices` / `marketPrice` / `valueEstimate` back. No Anthropic call, so a re-price costs one proxy request and nothing else; it has its own `prices` quota bucket (1000/day) so re-pricing a big collection can't eat the scanning allowance. A hand-typed estimate (`valueEstimate.userEdited`) is **never** overwritten — the comps are still stored so the user sees them beside their own number. Surfaced as a Collection-view sweep ("💲 Check real sold prices for N cards", counted collection-wide, confirm dialog first, three at a time) and a per-card button on the detail page. `pricesRefreshedAt` marks a card as done — set even when zero comps were found, so cards eBay genuinely has no match for aren't retried forever; `needsPriceRefresh()` on the client mirrors that rule.
+
+Note the bulk runners call `forgetCachedDetail()` when they finish: the detail view caches the last card it rendered and reuses it for the same id, so without that, opening a card visited *before* a sweep showed its pre-sweep price.
+
 ⚠️ Scraping via a proxy deliberately works around eBay's bot protection and is against their ToS. Fine-ish at one-request-per-scan personal volume, but it can break at any time and is not a foundation to build on.
 
 Other options considered:
@@ -136,6 +140,8 @@ users/{uid}/cards/{cardId}
   ebayPrices?      // real recent eBay sold-comp stats from identifyCard, or null
                    //   { median, min, max, count, query, searchUrl, fetchedAt }
                    //   (when no comps found: { query, count: 0, searchUrl })
+  pricesRefreshedAt? // ISO timestamp of the last refreshPrices run. Absent ⇒ never
+                     // priced against real sold listings (i.e. scanned pre-2026-07-21)
   userNotes?       // free text
   locationId?      // → users/{uid}/locations/{id}
   conditionGuess?  // (planned — not yet implemented) user-entered string for v1; AI-graded later
@@ -197,7 +203,7 @@ card-vault/
   functions/
     package.json               (@anthropic-ai/sdk)
     package-lock.json
-    index.js                   (identifyCard onCall — Opus 4.8, branches by itemType card/pack/box; generateListing onCall — Opus 4.8 + web_search, AI eBay descriptions; createShareLink / revokeShareLink onCall — auth'd, manage shares/{token} + users/{uid}.shareToken; getSharedCollection onCall — PUBLIC/no-auth, returns owner's kept cards with values/notes/location stripped; onCardDeleted trigger — cleans up Storage images)
+    index.js                   (identifyCard onCall — Opus 4.8, branches by itemType card/pack/box; identifyStored onCall — re-identify a saved card from its Storage images; refreshPrices onCall — re-price a saved card from real sold listings, no model call; generateListing onCall — Opus 4.8 + web_search, AI eBay descriptions; createShareLink / revokeShareLink onCall — auth'd, manage shares/{token} + users/{uid}.shareToken; getSharedCollection onCall — PUBLIC/no-auth, returns owner's kept cards with values/notes/location stripped; onCardDeleted trigger — cleans up Storage images)
   scripts/
     generate-icons.mjs         (npm run icons — SVG→PNG, legacy)
     import-icon.mjs            (npm run icon:import — chroma-key + resize)
