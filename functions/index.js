@@ -432,12 +432,15 @@ async function identifyImages(frontImageBase64, backImageBase64, type) {
       // one or two are noise, and eBay results mix in graded copies, lots, and
       // near-miss variants, so the median is an approximation, not a quote.
       if (ebay && ebay.count >= 3 && ebay.median > 0) {
+        // Whole dollars — a ±30% band is an approximation, and "$836.5" reads
+        // as broken precision to the person deciding whether to keep the card.
         parsed.valueEstimate = {
-          low: Math.max(0.5, Math.round(ebay.median * 70) / 100),
-          high: Math.round(ebay.median * 130) / 100,
+          low: Math.max(1, Math.round(ebay.median * 0.7)),
+          high: Math.max(1, Math.round(ebay.median * 1.3)),
           note:
             `Based on ${ebay.count} recent eBay sold listings ` +
-            `(median $${ebay.median.toFixed(2)}). Check the listings yourself for condition.`,
+            `(median $${ebay.median.toLocaleString("en-US", { maximumFractionDigits: 2 })}). ` +
+            `Check the listings yourself for condition.`,
           estimatedAt: new Date().toISOString(),
           source: "ebay_sold",
         };
@@ -727,20 +730,35 @@ async function fetchMarketPrice(query) {
 // price stats. Returns { count: 0 } when no usable prices are found, otherwise
 // { median, min, max, count } rounded to cents. Best-effort by design.
 function parseEbaySoldHtml(html, maxResults = 60) {
-  const priceMatches = [
-    ...String(html || "").matchAll(
-      /<span class="s-item__price">[^<]*?\$([\d,]+(?:\.\d{2})?)[^<]*?<\/span>/g,
+  const text = String(html || "");
+
+  // Current (2026) results layout: each card's price span carries both
+  // su-styled-text and s-card__price classes. Only "positive" (green) prices
+  // are genuine SOLD amounts — sponsored and active listings mixed into the
+  // page render "primary" (black), and counting those would poison the median
+  // with exactly the asking prices this feature exists to escape.
+  let prices = [
+    ...text.matchAll(
+      /<span class="(?=[^"]*\bpositive\b)(?=[^"]*\bs-card__price\b)[^"]*">[^<]*?\$([\d,]+(?:\.\d{2})?)/g,
     ),
-  ];
-  let prices = priceMatches
+  ]
     .map((m) => parseFloat(m[1].replace(/,/g, "")))
     .filter((p) => !isNaN(p) && p > 0);
 
-  // eBay's first result row is frequently a stale "Shop on eBay" template price.
-  // Drop the first match, but only when there's enough data that losing one
-  // entry won't distort the result.
-  if (prices.length > 3) {
-    prices = prices.slice(1);
+  if (prices.length === 0) {
+    // Pre-2026 layout fallback, in case eBay still serves the old template to
+    // some sessions. Its first row is frequently a stale "Shop on eBay"
+    // placeholder price, so drop it when there's enough data to spare one.
+    prices = [
+      ...text.matchAll(
+        /<span class="s-item__price">[^<]*?\$([\d,]+(?:\.\d{2})?)[^<]*?<\/span>/g,
+      ),
+    ]
+      .map((m) => parseFloat(m[1].replace(/,/g, "")))
+      .filter((p) => !isNaN(p) && p > 0);
+    if (prices.length > 3) {
+      prices = prices.slice(1);
+    }
   }
 
   prices = prices.slice(0, maxResults);
@@ -792,10 +810,12 @@ async function fetchEbaySoldPrices(query, maxResults = 60) {
     : searchUrl;
 
   // Abort a slow response so it can't hang the function and discard an
-  // otherwise-successful identification. Proxies add a real round trip (they
-  // fetch the page for us), so they need a much longer leash than a direct hit.
+  // otherwise-successful identification. Proxies fetch the page for us and
+  // retry upstream blocks internally — observed anywhere from 5s to 25s+, and
+  // ScraperAPI advises allowing up to ~60s. 40s catches the slow tail while
+  // keeping vision + lookup under the client SDK's 70s callable timeout.
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), template ? 25000 : 6000);
+  const timer = setTimeout(() => controller.abort(), template ? 40000 : 6000);
   try {
     const response = await fetch(requestUrl, {
       signal: controller.signal,
@@ -817,6 +837,12 @@ async function fetchEbaySoldPrices(query, maxResults = 60) {
     const html = await response.text();
 
     const stats = parseEbaySoldHtml(html, maxResults);
+    // One success line so "is the proxy working?" is answerable from the logs
+    // alone — failures already log their status and mode above.
+    console.log(
+      `eBay comps: ${stats.count} for query "${query}"` +
+        (template ? " (via proxy)" : " (direct)"),
+    );
     if (stats.count === 0) {
       return { query, count: 0, searchUrl };
     }
