@@ -67,7 +67,7 @@ const PRICE_ALGO = 2;
 // Deploy stamp, written by scripts/stamp-version.mjs (hosting predeploy hook).
 // Compared against the page's <meta name="cv-build"> and the server's
 // version.json to detect stale installs — see enforceVersionSync().
-const BUILD = "20260721-190822-d025649";
+const BUILD = "20260721-192107-e3be7b8";
 
 let auth, db, storage, functions, currentUser;
 
@@ -2540,7 +2540,9 @@ async function renderSharedView(token) {
   const cards = Array.isArray(data.cards) ? data.cards : [];
   const count = typeof data.count === "number" ? data.count : cards.length;
   // Held so tapping a tile can open BOTH sides — the grid shows fronts only.
-  sharedCardsCache = cards;
+  // __order preserves the server's newest-first ordering, which is the only
+  // record of "when added" once createdAt is stripped from the payload.
+  sharedCardsCache = cards.map((c, i) => ({ ...c, __order: i }));
 
   if (cards.length === 0) {
     shareViewContentEl.innerHTML = `
@@ -2552,15 +2554,218 @@ async function renderSharedView(token) {
     return;
   }
 
-  const tiles = cards.map(renderSharedTile).join("");
+  // Shell + controls render once; only the grid repaints as filters change, so
+  // typing in the search box doesn't tear out the input under the cursor.
   shareViewContentEl.innerHTML = `
     <div class="share-view-head">
       <h2 tabindex="-1">Shared collection <span class="share-view-tag">view only</span></h2>
-      <p class="muted">${count} card${count === 1 ? "" : "s"}</p>
+      <p id="share-count" class="muted">${count} card${count === 1 ? "" : "s"}</p>
     </div>
-    <div class="share-grid">${tiles}</div>
+    ${shareControlsHTML(cards)}
+    <div id="share-grid" class="share-grid"></div>
+    <div id="share-empty" class="empty-state" hidden></div>
   `;
+  wireShareControls();
+  drawSharedGrid();
   focusHeadingEl(shareViewContentEl.querySelector("h2"));
+}
+
+// What the recipient can narrow by. Deliberately smaller than the owner's set:
+// no price sorts and no location filter, because neither is in the payload.
+const shareFilters = {
+  search: "",
+  sort: "newest",
+  itemType: "all",
+  sport: "all",
+  rookieOnly: false,
+  hofOnly: false,
+  yearFrom: null,
+  yearTo: null,
+};
+
+const SPORT_LABELS = {
+  baseball: "Baseball",
+  football: "Football",
+  basketball: "Basketball",
+  hockey: "Hockey",
+};
+
+function titleCase(s) {
+  return String(s || "").replace(/\b[a-z]/g, (m) => m.toUpperCase());
+}
+
+// Options are built from what's actually in this collection — offering "Hockey"
+// for a shoebox of 1950s baseball would just be noise.
+function shareControlsHTML(cards) {
+  const sports = [...new Set(cards.map((c) => c.identified?.sport).filter(Boolean))].sort();
+  const types = [...new Set(cards.map((c) => itemTypeOf(c)))];
+  const years = cards.map((c) => c.identified?.year).filter((y) => typeof y === "number");
+  const minYear = years.length ? Math.min(...years) : "";
+  const maxYear = years.length ? Math.max(...years) : "";
+  const anyRookie = cards.some((c) => c.identified?.isRookie);
+  const anyHof = cards.some((c) => c.identified?.isHOF);
+
+  const typeLabels = { card: "Single cards", pack: "Sealed packs", box: "Sealed boxes" };
+
+  return `
+    <input id="share-search" type="search" class="search-input" placeholder="Search player, year, set..." />
+    <div class="collection-controls">
+      <select id="share-sort" class="control-select" aria-label="Sort">
+        <option value="newest">Newest added first</option>
+        <option value="oldest">Oldest added first</option>
+        <option value="oldest-cards">Oldest cards (year)</option>
+        <option value="newest-cards">Newest cards (year)</option>
+        <option value="player-az">Player A&ndash;Z</option>
+      </select>
+      <button id="share-filters-toggle" type="button" class="control-btn"
+              aria-controls="share-filters-panel" aria-expanded="false">Filters</button>
+    </div>
+    <div id="share-filters-panel" class="filters-panel" hidden>
+      <div class="filters-row">
+        ${types.length > 1 ? `
+          <label class="filter-field">Type
+            <select id="share-filter-type">
+              <option value="all">All items</option>
+              ${types.map((t) => `<option value="${t}">${typeLabels[t] || titleCase(t)}</option>`).join("")}
+            </select>
+          </label>` : ""}
+        ${sports.length > 1 ? `
+          <label class="filter-field">Sport
+            <select id="share-filter-sport">
+              <option value="all">All sports</option>
+              ${sports.map((s) => `<option value="${esc(s)}">${esc(SPORT_LABELS[s] || titleCase(s))}</option>`).join("")}
+            </select>
+          </label>` : ""}
+      </div>
+      ${anyRookie || anyHof ? `
+        <div class="filter-chips">
+          ${anyRookie ? `<label class="chip-toggle"><input type="checkbox" id="share-filter-rookie" /><span>Rookies only</span></label>` : ""}
+          ${anyHof ? `<label class="chip-toggle"><input type="checkbox" id="share-filter-hof" /><span>Hall of Famers only</span></label>` : ""}
+        </div>` : ""}
+      <div class="filters-row">
+        <label class="filter-field">From year
+          <input type="number" id="share-filter-year-from" inputmode="numeric" placeholder="${minYear}" />
+        </label>
+        <label class="filter-field">To year
+          <input type="number" id="share-filter-year-to" inputmode="numeric" placeholder="${maxYear}" />
+        </label>
+      </div>
+      <button id="share-filters-clear" type="button" class="link-button">Clear all filters</button>
+    </div>
+  `;
+}
+
+function wireShareControls() {
+  const on = (id, evt, fn) => {
+    const el = document.getElementById(id);
+    if (el) el.addEventListener(evt, fn);
+  };
+  const num = (v) => {
+    const n = parseInt(String(v).trim(), 10);
+    return Number.isFinite(n) ? n : null;
+  };
+
+  on("share-search", "input", (e) => { shareFilters.search = e.target.value; drawSharedGrid(); });
+  on("share-sort", "change", (e) => { shareFilters.sort = e.target.value; drawSharedGrid(); });
+  on("share-filter-type", "change", (e) => { shareFilters.itemType = e.target.value; drawSharedGrid(); });
+  on("share-filter-sport", "change", (e) => { shareFilters.sport = e.target.value; drawSharedGrid(); });
+  on("share-filter-rookie", "change", (e) => { shareFilters.rookieOnly = e.target.checked; drawSharedGrid(); });
+  on("share-filter-hof", "change", (e) => { shareFilters.hofOnly = e.target.checked; drawSharedGrid(); });
+  on("share-filter-year-from", "input", (e) => { shareFilters.yearFrom = num(e.target.value); drawSharedGrid(); });
+  on("share-filter-year-to", "input", (e) => { shareFilters.yearTo = num(e.target.value); drawSharedGrid(); });
+
+  on("share-filters-toggle", "click", () => {
+    const panel = document.getElementById("share-filters-panel");
+    const btn = document.getElementById("share-filters-toggle");
+    const open = panel.hidden;
+    panel.hidden = !open;
+    btn.setAttribute("aria-expanded", String(open));
+  });
+
+  on("share-filters-clear", "click", clearShareFilters);
+}
+
+function clearShareFilters() {
+  Object.assign(shareFilters, {
+    search: "", sort: shareFilters.sort, itemType: "all", sport: "all",
+    rookieOnly: false, hofOnly: false, yearFrom: null, yearTo: null,
+  });
+  const set = (id, prop, val) => {
+    const el = document.getElementById(id);
+    if (el) el[prop] = val;
+  };
+  set("share-search", "value", "");
+  set("share-filter-type", "value", "all");
+  set("share-filter-sport", "value", "all");
+  set("share-filter-rookie", "checked", false);
+  set("share-filter-hof", "checked", false);
+  set("share-filter-year-from", "value", "");
+  set("share-filter-year-to", "value", "");
+  drawSharedGrid();
+}
+
+function applyShareFilters(cards) {
+  const term = shareFilters.search.trim().toLowerCase();
+  const f = shareFilters;
+  const filtered = cards.filter((c) => {
+    if (term) {
+      const id = c.identified || {};
+      const haystack = `${id.player || ""} ${id.itemLabel || ""} ${id.year || ""} ${id.set || ""} ${id.team || ""} ${id.cardNumber || ""}`.toLowerCase();
+      if (!haystack.includes(term)) return false;
+    }
+    if (f.itemType !== "all" && itemTypeOf(c) !== f.itemType) return false;
+    if (f.sport !== "all" && c.identified?.sport !== f.sport) return false;
+    if (f.rookieOnly && !c.identified?.isRookie) return false;
+    if (f.hofOnly && !c.identified?.isHOF) return false;
+    const y = c.identified?.year;
+    if (f.yearFrom !== null && (typeof y !== "number" || y < f.yearFrom)) return false;
+    if (f.yearTo !== null && (typeof y !== "number" || y > f.yearTo)) return false;
+    return true;
+  });
+
+  // createdAt is deliberately stripped from the payload, so "newest added"
+  // can't be computed here — it's the order the server already sorted into,
+  // preserved as __order when the payload was cached.
+  const cmp = {
+    newest: (a, b) => a.__order - b.__order,
+    oldest: (a, b) => b.__order - a.__order,
+    "newest-cards": (a, b) => (b.identified?.year || 0) - (a.identified?.year || 0),
+    "oldest-cards": (a, b) => (a.identified?.year || 9999) - (b.identified?.year || 9999),
+    "player-az": (a, b) =>
+      (a.identified?.player || a.identified?.itemLabel || "").localeCompare(
+        b.identified?.player || b.identified?.itemLabel || "",
+      ),
+  }[f.sort] || ((a, b) => a.__order - b.__order);
+
+  return filtered.slice().sort(cmp);
+}
+
+function drawSharedGrid() {
+  const grid = document.getElementById("share-grid");
+  const empty = document.getElementById("share-empty");
+  const countEl = document.getElementById("share-count");
+  if (!grid) return;
+
+  const total = sharedCardsCache.length;
+  const shown = applyShareFilters(sharedCardsCache);
+
+  if (countEl) {
+    countEl.textContent =
+      shown.length === total
+        ? `${total} card${total === 1 ? "" : "s"}`
+        : `${shown.length} of ${total} cards`;
+  }
+
+  grid.innerHTML = shown.map(renderSharedTile).join("");
+  if (empty) {
+    empty.hidden = shown.length > 0;
+    empty.innerHTML = shown.length
+      ? ""
+      : `<p>No cards match what you're looking for.</p>
+         <button type="button" class="link-button" id="share-empty-clear">Clear all filters</button>`;
+    const clearBtn = document.getElementById("share-empty-clear");
+    if (clearBtn) clearBtn.addEventListener("click", clearShareFilters);
+  }
 }
 
 // One non-clickable read-only tile. Mirrors the .collection-card visual style
