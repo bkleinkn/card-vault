@@ -59,6 +59,11 @@ const FIREBASE_READY = !firebaseConfig.apiKey.startsWith("REPLACE_");
 // set the ANTHROPIC_API_KEY secret and deployed the identifyCard Cloud Function.
 const USE_MOCK_AI = false;
 
+// Deploy stamp, written by scripts/stamp-version.mjs (hosting predeploy hook).
+// Compared against the page's <meta name="cv-build"> and the server's
+// version.json to detect stale installs — see enforceVersionSync().
+const BUILD = "20260721-135606-1a7d994";
+
 let auth, db, storage, functions, currentUser;
 
 if (FIREBASE_READY) {
@@ -4125,9 +4130,100 @@ document.addEventListener("click", async (e) => {
   }
 });
 
+// --- Version check (self-healing for stale installs) ------------------------
+// Why this exists: an iOS home-screen install runs in its own container with
+// its own cache, and one kept serving old code across six deploys (2026-07-20)
+// — every fix shipped that day landed on the live site while the affected
+// iPhone never saw any of them. The service-worker updater can't help there:
+// it is itself part of the stale copy. This check compares the deploy stamp
+// baked into this script against (a) the stamp in the page that loaded it and
+// (b) the server's version.json, and reloads ONCE to converge when they drift.
+//
+// Guard rails: never reloads with unsaved work on screen, at most one auto-
+// reload per 10 minutes per tab (a broken state must degrade to a polite
+// nudge, not a reload loop), and does nothing when offline or unstamped.
+
+let updateNudgeShown = false;
+
+function nudgeUpdate() {
+  if (updateNudgeShown) return;
+  updateNudgeShown = true;
+  showToast("A new version of Card Vault is ready — refresh when you're done.", { variant: "info" });
+}
+
+// Reloading is destructive to anything held only in memory. Block while: scans
+// are identifying, an unsaved result is up, the camera is live (possibly mid
+// front/back pair), or an edit form is open.
+function updateReloadIsSafe() {
+  return (
+    QUEUE.jobs.length === 0 &&
+    !state.lastIdentified &&
+    !cameraStream &&
+    !reviewState.editing &&
+    !detailState.editing &&
+    !(location.hash || "").startsWith("#/result")
+  );
+}
+
+async function enforceVersionSync(trigger) {
+  if (!/^\d/.test(BUILD)) return; // unstamped dev copy — nothing to compare
+
+  // (a) Shell/script drift: the page and this script came from different
+  // deploys (one cached, one fresh). Detectable without any network.
+  const meta = document.querySelector('meta[name="cv-build"]');
+  const shellBuild = (meta && meta.content) || "";
+  let drift = null;
+  if (/^\d/.test(shellBuild) && shellBuild !== BUILD) {
+    drift = `shell ${shellBuild}`;
+  } else {
+    // (b) Server drift: a fresh, uncached fetch of version.json. Offline or a
+    // failed fetch proves nothing, so it never triggers anything.
+    try {
+      const res = await fetch("version.json", { cache: "no-store" });
+      if (res.ok) {
+        const v = await res.json();
+        if (v && typeof v.build === "string" && /^\d/.test(v.build) && v.build !== BUILD) {
+          drift = `server ${v.build}`;
+        }
+      }
+    } catch (_) { /* offline — skip */ }
+  }
+  if (!drift) return;
+
+  if (!updateReloadIsSafe()) {
+    nudgeUpdate();
+    return;
+  }
+
+  let lastReload = 0;
+  try { lastReload = Number(sessionStorage.getItem("cv-auto-reload-at")) || 0; } catch (_) { /* private mode */ }
+  if (Date.now() - lastReload < 10 * 60 * 1000) {
+    // We already reloaded recently and are STILL stale — reloading again won't
+    // fix it. Stop and tell the user instead of looping.
+    nudgeUpdate();
+    return;
+  }
+  try { sessionStorage.setItem("cv-auto-reload-at", String(Date.now())); } catch (_) { /* private mode */ }
+
+  console.warn(`Version drift (${trigger}): running ${BUILD}, ${drift} — reloading to update.`);
+  // Best effort: also nudge the service worker so IT updates, not just the page.
+  try {
+    const reg = await navigator.serviceWorker.getRegistration();
+    if (reg) reg.update().catch(() => {});
+  } catch (_) { /* no SW — fine */ }
+  location.reload();
+}
+
+// Resume is the moment that mattered on iOS: a home-screen app comes back from
+// the switcher with its old frozen page — this is our chance to notice.
+document.addEventListener("visibilitychange", () => {
+  if (!document.hidden) enforceVersionSync("resume");
+});
+
 // --- Boot ------------------------------------------------------------------
 updateUserChip(); // "Signing in…" until the first auth state resolves
 route();
+enforceVersionSync("boot");
 
 if ("serviceWorker" in navigator) {
   window.addEventListener("load", async () => {

@@ -1,6 +1,7 @@
 {
   "hosting": {
     "public": "public",
+    "predeploy": ["node scripts/stamp-version.mjs"],
     "ignore": ["firebase.json", "**/.*", "**/node_modules/**", "icons/card-vault-icon.png"],
     "rewrites": [{ "source": "**", "destination": "/index.html" }],
     "headers": [
@@ -17,6 +18,10 @@
       {
         "source": "**/*.@(js|css|html|json)",
         "headers": [{ "key": "Cache-Control", "value": "no-cache" }]
+      },
+      {
+        "source": "/version.json",
+        "headers": [{ "key": "Cache-Control", "value": "no-store" }]
       }
     ]
   },

@@ -44,6 +44,10 @@ const STATIC_EXT = /\.(?:js|css|json|png)$/i;
 
 function isStaticAsset(url) {
   const path = url.pathname.replace(/^\//, "");
+  // version.json is the client's staleness probe — serving it from cache would
+  // make a stale install report itself as current. Never cache it; when
+  // offline the fetch simply fails and the version check skips.
+  if (path === "version.json") return false;
   return SHELL_ASSETS.includes(path) || SHELL_ASSETS.includes("./" + path) || STATIC_EXT.test(url.pathname);
 }
 
