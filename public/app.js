@@ -62,7 +62,7 @@ const USE_MOCK_AI = false;
 // Deploy stamp, written by scripts/stamp-version.mjs (hosting predeploy hook).
 // Compared against the page's <meta name="cv-build"> and the server's
 // version.json to detect stale installs — see enforceVersionSync().
-const BUILD = "20260721-140544-ef16b81";
+const BUILD = "20260721-150014-e89c84f";
 
 let auth, db, storage, functions, currentUser;
 
@@ -2673,8 +2673,8 @@ function renderDetailDisplay(el) {
     ${c.userNotes ? `<div class="notes-display">${esc(c.userNotes)}</div>` : ""}
     ${ebaySectionHTML(c)}
     ${IS_DEMO ? "" : `<div class="row"><button id="detail-edit-btn" class="big-button">Edit details &amp; notes</button></div>`}
-    ${c.imageFrontUrl ? `<img src="${esc(c.imageFrontUrl)}" alt="Front" />` : ""}
-    ${c.imageBackUrl ? `<img src="${esc(c.imageBackUrl)}" alt="Back" />` : ""}
+    ${c.imageFrontUrl ? `<img class="card-photo" src="${esc(c.imageFrontUrl)}" alt="Front" />` : ""}
+    ${c.imageBackUrl ? `<img class="card-photo" src="${esc(c.imageBackUrl)}" alt="Back" />` : ""}
     ${IS_DEMO ? "" : `<button id="delete-btn" class="big-button" style="color:var(--danger);">Remove from collection</button>`}
   `;
 
@@ -3281,8 +3281,8 @@ function renderReviewDisplay() {
       ${resultBody}
     </div>
     ${c.locationId && locationName(c.locationId) ? `<div class="location-display"><span aria-hidden="true">📍</span> <strong>Location:</strong> ${esc(locationName(c.locationId))}</div>` : ""}
-    ${c.imageFrontUrl ? `<img src="${esc(c.imageFrontUrl)}" alt="Front" />` : ""}
-    ${c.imageBackUrl ? `<img src="${esc(c.imageBackUrl)}" alt="Back" />` : ""}
+    ${c.imageFrontUrl ? `<img class="card-photo" src="${esc(c.imageFrontUrl)}" alt="Front" />` : ""}
+    ${c.imageBackUrl ? `<img class="card-photo" src="${esc(c.imageBackUrl)}" alt="Back" />` : ""}
     <div class="row">
       <button id="review-keep-btn" class="big-button primary">Keep in collection</button>
       <button id="review-discard-btn" class="big-button">Discard</button>
@@ -3692,6 +3692,289 @@ async function handleSignOut() {
 // own DOM (appended to <body>), so no extra HTML is needed in index.html.
 
 // Non-blocking toast. opts.variant: "error" | "info" | "success" (default info).
+// --- Full-screen image viewer ----------------------------------------------
+// Tap any card photo (collection thumbnail, share gallery, detail/review
+// photos) to inspect it up close: pinch, double-tap, or scroll to zoom, drag
+// to pan. The phone's back gesture closes the viewer instead of leaving the
+// page. Built once and reused, like the toasts and modals above.
+
+const viewerState = {
+  el: null,
+  stage: null,
+  img: null,
+  sides: null,
+  items: [],       // [{ src, label }] — front/back of the same card
+  index: 0,
+  scale: 1,
+  tx: 0,
+  ty: 0,
+  pointers: new Map(),
+  pinch: null,     // { dist, scale, mid } while two fingers are down
+  lastTap: null,   // { t, x, y } for double-tap detection
+  historyArmed: false,
+};
+
+function viewerApplyTransform() {
+  const v = viewerState;
+  v.img.style.transform = `translate(${v.tx}px, ${v.ty}px) scale(${v.scale})`;
+  v.stage.classList.toggle("cv-zoomed", v.scale > 1.01);
+}
+
+// Zoom so the on-screen point (px, py) stays put. With transform-origin at the
+// image center: rendered = center + t + s·u, so changing s→s2 needs
+// t += (s − s2)·u where u is the point's offset in unscaled image units.
+function viewerZoomTo(newScale, px, py) {
+  const v = viewerState;
+  const s2 = Math.min(6, Math.max(1, newScale));
+  const r = v.img.getBoundingClientRect();
+  const ux = (px - (r.left + r.width / 2)) / v.scale;
+  const uy = (py - (r.top + r.height / 2)) / v.scale;
+  v.tx += (v.scale - s2) * ux;
+  v.ty += (v.scale - s2) * uy;
+  v.scale = s2;
+  if (v.scale <= 1.01) {
+    v.scale = 1;
+    v.tx = 0;
+    v.ty = 0;
+  }
+  viewerClampPan();
+  viewerApplyTransform();
+}
+
+// Keep at least part of the photo on screen — a hard fling can't lose it, and
+// double-tap always resets anyway.
+function viewerClampPan() {
+  const v = viewerState;
+  const stage = v.stage.getBoundingClientRect();
+  const halfW = (v.img.offsetWidth * v.scale + stage.width) / 2 - 48;
+  const halfH = (v.img.offsetHeight * v.scale + stage.height) / 2 - 48;
+  v.tx = Math.min(halfW, Math.max(-halfW, v.tx));
+  v.ty = Math.min(halfH, Math.max(-halfH, v.ty));
+}
+
+function viewerSetSide(i) {
+  const v = viewerState;
+  if (!v.items[i]) return;
+  v.index = i;
+  v.scale = 1;
+  v.tx = 0;
+  v.ty = 0;
+  v.img.src = v.items[i].src;
+  v.img.alt = v.items[i].label;
+  viewerApplyTransform();
+  if (v.items.length > 1) {
+    v.sides.hidden = false;
+    v.sides.innerHTML = v.items
+      .map(
+        (it, j) =>
+          `<button type="button" class="cv-viewer-side${j === i ? " active" : ""}" data-side="${j}">${esc(it.label)}</button>`,
+      )
+      .join("");
+  } else {
+    v.sides.hidden = true;
+    v.sides.innerHTML = "";
+  }
+}
+
+function viewerKeydown(e) {
+  if (e.key === "Escape") {
+    e.preventDefault();
+    closeImageViewer();
+  } else if (e.key === "ArrowRight" || e.key === "ArrowLeft") {
+    const v = viewerState;
+    if (v.items.length > 1) {
+      e.preventDefault();
+      viewerSetSide((v.index + (e.key === "ArrowRight" ? 1 : v.items.length - 1)) % v.items.length);
+    }
+  }
+}
+
+function viewerPointerDown(e) {
+  const v = viewerState;
+  try { v.stage.setPointerCapture(e.pointerId); } catch (_) { /* fine */ }
+  v.pointers.set(e.pointerId, {
+    x: e.clientX, y: e.clientY,
+    sx: e.clientX, sy: e.clientY,
+    t: performance.now(),
+    moved: false,
+    onImg: e.target === v.img,
+  });
+  if (v.pointers.size === 2) {
+    const [a, b] = [...v.pointers.values()];
+    v.pinch = {
+      dist: Math.hypot(a.x - b.x, a.y - b.y),
+      scale: v.scale,
+      mid: { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 },
+    };
+  }
+  e.preventDefault();
+}
+
+function viewerPointerMove(e) {
+  const v = viewerState;
+  const p = v.pointers.get(e.pointerId);
+  if (!p) return;
+  const dx = e.clientX - p.x;
+  const dy = e.clientY - p.y;
+  p.x = e.clientX;
+  p.y = e.clientY;
+  if (Math.hypot(p.x - p.sx, p.y - p.sy) > 8) p.moved = true;
+
+  if (v.pointers.size === 2 && v.pinch) {
+    const [a, b] = [...v.pointers.values()];
+    const dist = Math.hypot(a.x - b.x, a.y - b.y);
+    const mid = { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 };
+    // Follow the fingers: pan by the midpoint's movement, then scale about it.
+    v.tx += mid.x - v.pinch.mid.x;
+    v.ty += mid.y - v.pinch.mid.y;
+    v.pinch.mid = mid;
+    if (v.pinch.dist > 0) viewerZoomTo(v.pinch.scale * (dist / v.pinch.dist), mid.x, mid.y);
+  } else if (v.pointers.size === 1 && v.scale > 1) {
+    v.tx += dx;
+    v.ty += dy;
+    viewerClampPan();
+    viewerApplyTransform();
+  }
+}
+
+function viewerPointerUp(e) {
+  const v = viewerState;
+  const p = v.pointers.get(e.pointerId);
+  v.pointers.delete(e.pointerId);
+  if (v.pointers.size < 2) v.pinch = null;
+  if (!p || p.moved || performance.now() - p.t > 350) return;
+
+  // A clean tap. Two quick ones on the photo toggle zoom; a single tap on the
+  // dark backdrop closes (only at rest — while zoomed, stray taps are ignored).
+  const now = performance.now();
+  if (p.onImg) {
+    if (v.lastTap && now - v.lastTap.t < 320 && Math.hypot(p.x - v.lastTap.x, p.y - v.lastTap.y) < 40) {
+      v.lastTap = null;
+      viewerZoomTo(v.scale > 1.01 ? 1 : 2.5, p.x, p.y);
+    } else {
+      v.lastTap = { t: now, x: p.x, y: p.y };
+    }
+  } else if (v.scale === 1) {
+    closeImageViewer();
+  }
+}
+
+function ensureViewerDom() {
+  const v = viewerState;
+  if (v.el) return;
+  const el = document.createElement("div");
+  el.id = "cv-viewer";
+  el.className = "cv-viewer";
+  el.setAttribute("role", "dialog");
+  el.setAttribute("aria-modal", "true");
+  el.setAttribute("aria-label", "Card photo viewer");
+  el.hidden = true;
+  el.innerHTML = `
+    <div class="cv-viewer-stage"><img class="cv-viewer-img" alt="" draggable="false" decoding="async" /></div>
+    <button type="button" class="cv-viewer-close" aria-label="Close photo viewer">&times;</button>
+    <div class="cv-viewer-bar">
+      <div class="cv-viewer-sides" hidden></div>
+      <div class="cv-viewer-hint">Pinch, scroll, or double-tap to zoom</div>
+    </div>
+  `;
+  document.body.appendChild(el);
+  v.el = el;
+  v.stage = el.querySelector(".cv-viewer-stage");
+  v.img = el.querySelector(".cv-viewer-img");
+  v.sides = el.querySelector(".cv-viewer-sides");
+
+  el.querySelector(".cv-viewer-close").addEventListener("click", closeImageViewer);
+  v.sides.addEventListener("click", (e) => {
+    const btn = e.target.closest("[data-side]");
+    if (btn) viewerSetSide(Number(btn.dataset.side));
+  });
+  v.stage.addEventListener("pointerdown", viewerPointerDown);
+  v.stage.addEventListener("pointermove", viewerPointerMove);
+  v.stage.addEventListener("pointerup", viewerPointerUp);
+  v.stage.addEventListener("pointercancel", viewerPointerUp);
+  v.stage.addEventListener(
+    "wheel",
+    (e) => {
+      e.preventDefault();
+      viewerZoomTo(viewerState.scale * Math.exp(-e.deltaY * 0.002), e.clientX, e.clientY);
+    },
+    { passive: false },
+  );
+  // iOS Safari's own page-zoom gesture must not fight the pinch handler.
+  el.addEventListener("gesturestart", (e) => e.preventDefault());
+}
+
+function openImageViewer(items, index = 0) {
+  ensureViewerDom();
+  const v = viewerState;
+  v.items = items;
+  v.pointers.clear();
+  v.pinch = null;
+  v.lastTap = null;
+  viewerSetSide(index);
+  v.el.hidden = false;
+  document.body.classList.add("cv-viewer-open");
+  document.addEventListener("keydown", viewerKeydown, true);
+  // One history entry so the phone's back gesture closes the viewer instead
+  // of leaving the app. Same URL, so the hash router never notices.
+  try {
+    history.pushState({ cvViewer: true }, "");
+    v.historyArmed = true;
+  } catch (_) {
+    v.historyArmed = false;
+  }
+}
+
+function hideImageViewer() {
+  const v = viewerState;
+  if (!v.el || v.el.hidden) return;
+  v.historyArmed = false;
+  v.el.hidden = true;
+  document.body.classList.remove("cv-viewer-open");
+  document.removeEventListener("keydown", viewerKeydown, true);
+}
+
+function closeImageViewer() {
+  const v = viewerState;
+  if (!v.el || v.el.hidden) return;
+  if (v.historyArmed) {
+    // Consume the entry we pushed; the popstate handler does the hiding.
+    history.back();
+  } else {
+    hideImageViewer();
+  }
+}
+
+window.addEventListener("popstate", () => {
+  if (viewerState.el && !viewerState.el.hidden) hideImageViewer();
+});
+
+// One delegated listener opens the viewer from every surface that shows a
+// card photo. Inside linked rows (collection, share gallery) the photo tap
+// means "inspect", not "navigate" — the rest of the row still opens the card.
+document.addEventListener("click", (e) => {
+  const img = e.target.closest("img");
+  if (!img || !img.getAttribute("src")) return;
+  const isPhoto = img.classList.contains("card-photo");
+  const inRow = img.closest(".collection-card, .share-card");
+  if (!isPhoto && !inRow) return;
+  e.preventDefault();
+  e.stopPropagation();
+  if (isPhoto) {
+    // Only photos in the VISIBLE view — inactive views keep their rendered
+    // DOM (display:none), and their photos must not join the Front/Back set.
+    const all = [...document.querySelectorAll("img.card-photo")].filter(
+      (x) => x.getAttribute("src") && x.offsetParent !== null,
+    );
+    openImageViewer(
+      all.map((x) => ({ src: x.src, label: x.alt || "Photo" })),
+      Math.max(0, all.indexOf(img)),
+    );
+  } else {
+    openImageViewer([{ src: img.src, label: img.alt || "Card" }], 0);
+  }
+});
+
 function showToast(message, opts = {}) {
   const variant = opts.variant || "info";
   let container = document.getElementById("cv-toasts");

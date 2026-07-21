@@ -2252,6 +2252,121 @@ body.viewing-share { padding-bottom: 28px; }
   color: var(--ink);
 }
 
+/* ---------- Full-screen image viewer ----------
+   Opened by tapping any card photo. Pinch / double-tap / scroll to zoom,
+   drag to pan; the phone's back gesture closes it. Sits above nav and
+   content (z 950) but below modals (1000) and toasts (1100). */
+.cv-viewer {
+  position: fixed;
+  inset: 0;
+  z-index: 950;
+  background: rgba(2, 6, 23, 0.94);
+  backdrop-filter: blur(4px);
+  -webkit-backdrop-filter: blur(4px);
+  animation: cv-fade-in .15s ease;
+}
+
+.cv-viewer[hidden] { display: none; }
+
+body.cv-viewer-open { overflow: hidden; }
+
+.cv-viewer-stage {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  overflow: hidden;
+  touch-action: none;       /* all gestures are ours — no scroll/zoom fights */
+  cursor: zoom-in;
+}
+
+.cv-viewer-stage.cv-zoomed { cursor: grab; }
+
+.cv-viewer-img {
+  max-width: 94vw;
+  max-height: 86vh;
+  border-radius: var(--radius-sm);
+  box-shadow: 0 24px 70px rgba(0, 0, 0, 0.6);
+  user-select: none;
+  -webkit-user-drag: none;
+  will-change: transform;
+}
+
+.cv-viewer-close {
+  position: absolute;
+  top: calc(12px + env(safe-area-inset-top));
+  right: 14px;
+  z-index: 2;
+  width: var(--tap);
+  height: var(--tap);
+  border-radius: var(--radius-pill);
+  border: 1px solid var(--border-strong);
+  background: rgba(15, 23, 42, 0.85);
+  color: var(--ink);
+  font-size: 26px;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.cv-viewer-close:hover {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-glow);
+}
+
+.cv-viewer-bar {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  padding: 14px 16px calc(14px + env(safe-area-inset-bottom));
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 10px;
+  pointer-events: none;     /* never blocks pan — chips re-enable below */
+}
+
+.cv-viewer-sides {
+  display: flex;
+  gap: 8px;
+  pointer-events: auto;
+}
+
+.cv-viewer-side {
+  min-height: var(--tap);
+  padding: 8px 22px;
+  border-radius: var(--radius-pill);
+  border: 1px solid var(--border-strong);
+  background: rgba(15, 23, 42, 0.85);
+  color: var(--ink-2);
+  font-size: 14px;
+  font-weight: 600;
+  font-family: inherit;
+  cursor: pointer;
+}
+
+.cv-viewer-side.active {
+  background: var(--accent-strong);
+  border-color: var(--accent);
+  color: #fff;
+}
+
+.cv-viewer-hint {
+  font-size: 12px;
+  color: var(--ink-faint);
+  transition: opacity .3s ease;
+}
+
+/* The hint has done its job once the user starts zooming. */
+.cv-viewer-stage.cv-zoomed + .cv-viewer-close + .cv-viewer-bar .cv-viewer-hint,
+.cv-viewer:has(.cv-zoomed) .cv-viewer-hint { opacity: 0; }
+
+/* Card photos advertise that they open bigger. */
+img.card-photo,
+.collection-card img,
+.share-card img { cursor: zoom-in; }
+
 .ai-outage-banner .control-btn {
   align-self: flex-start;
 }
