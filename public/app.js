@@ -67,7 +67,7 @@ const PRICE_ALGO = 2;
 // Deploy stamp, written by scripts/stamp-version.mjs (hosting predeploy hook).
 // Compared against the page's <meta name="cv-build"> and the server's
 // version.json to detect stale installs — see enforceVersionSync().
-const BUILD = "20260721-190432-89b6d90";
+const BUILD = "20260721-190822-d025649";
 
 let auth, db, storage, functions, currentUser;
 
@@ -2509,6 +2509,10 @@ async function revokeShare() {
 // prices, notes, locations, edit/delete, or links into the owner's app.
 const shareViewContentEl = document.getElementById("share-view-content");
 
+// The cards behind the currently-open share link. The grid renders fronts, so
+// the viewer needs this to find the matching back when a tile is tapped.
+let sharedCardsCache = [];
+
 async function renderSharedView(token) {
   if (!shareViewContentEl) return;
   if (!FIREBASE_READY) {
@@ -2535,6 +2539,8 @@ async function renderSharedView(token) {
 
   const cards = Array.isArray(data.cards) ? data.cards : [];
   const count = typeof data.count === "number" ? data.count : cards.length;
+  // Held so tapping a tile can open BOTH sides — the grid shows fronts only.
+  sharedCardsCache = cards;
 
   if (cards.length === 0) {
     shareViewContentEl.innerHTML = `
@@ -2584,9 +2590,16 @@ function renderSharedTile(card) {
     badges.push(`<span class="badge sealed">Sealed</span>`);
   }
 
+  // The grid shows fronts. When there's a back too, say so — otherwise the
+  // recipient has no way to know a second photo exists behind the tap.
+  const hasBack = !!c.imageBackUrl;
+
   return `
-    <div class="share-card">
-      <img class="${rotClass(rotationOf(c, "front")).trim()}" src="${esc(c.imageFrontUrl || "")}" alt="${esc(name)}" loading="lazy" />
+    <div class="share-card" data-card-id="${esc(c.id || "")}">
+      <div class="share-card-photo">
+        <img class="${rotClass(rotationOf(c, "front")).trim()}" src="${esc(c.imageFrontUrl || "")}" alt="${esc(name)}" loading="lazy" />
+        ${hasBack ? `<span class="share-card-flip">Front + back</span>` : ""}
+      </div>
       <div class="info">
         <div class="name">${esc(name)}</div>
         ${meta ? `<div class="sub">${esc(meta)}</div>` : ""}
@@ -4219,19 +4232,31 @@ document.addEventListener("click", (e) => {
   // Share-gallery tiles aren't links, so the photo is the only thing there is
   // to tap. Collection thumbnails deliberately do NOT zoom — tapping anywhere
   // in that row, photo included, opens the card.
-  if (img.closest(".share-card")) {
+  const tile = img.closest(".share-card");
+  if (tile) {
     e.preventDefault();
     e.stopPropagation();
-    // Carry the tile's rotation into the viewer, or the recipient zooms a
-    // photo that snaps back to sideways. No side/cardId: they can't re-save it.
-    openImageViewer(
-      [{
-        src: img.src,
-        label: img.alt || "Card",
-        rotation: (img.className.match(/rot-(\d+)/) || [])[1] * 1 || 0,
-      }],
-      0,
-    );
+    // The grid only shows fronts, so open the card's BOTH sides here — the
+    // back is in the payload and was otherwise unreachable for a recipient.
+    // Rotations come along, or a straightened photo snaps back to sideways.
+    // No side/cardId: a recipient has nothing to save to.
+    const card = sharedCardsCache.find((c) => c.id === tile.dataset.cardId) || {};
+    const items = [];
+    if (card.imageFrontUrl || img.src) {
+      items.push({
+        src: card.imageFrontUrl || img.src,
+        label: "Front",
+        rotation: rotationOf(card, "front"),
+      });
+    }
+    if (card.imageBackUrl) {
+      items.push({
+        src: card.imageBackUrl,
+        label: "Back",
+        rotation: rotationOf(card, "back"),
+      });
+    }
+    if (items.length) openImageViewer(items, 0);
   }
 });
 

@@ -1771,12 +1771,34 @@ p { color: var(--ink-soft); margin: 8px 0; }
   color: var(--ink);
 }
 
+.share-card-photo {
+  position: relative;
+  overflow: hidden;
+}
+
 .share-card img {
   width: 100%;
   aspect-ratio: 5/7;
   object-fit: cover;
   background: var(--bg);
   display: block;
+}
+
+/* Tells the recipient a second photo is behind the tap — the grid shows
+   fronts only, so without this the back is invisible. */
+.share-card-flip {
+  position: absolute;
+  right: 8px;
+  bottom: 8px;
+  padding: 3px 9px;
+  border-radius: var(--radius-pill);
+  background: rgba(2, 6, 23, 0.78);
+  border: 1px solid var(--border-strong);
+  color: var(--ink-2);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.01em;
+  pointer-events: none;
 }
 
 .share-card .info {
