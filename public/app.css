@@ -2362,9 +2362,9 @@ body.cv-viewer-open { overflow: hidden; }
 .cv-viewer-stage.cv-zoomed + .cv-viewer-close + .cv-viewer-bar .cv-viewer-hint,
 .cv-viewer:has(.cv-zoomed) .cv-viewer-hint { opacity: 0; }
 
-/* Card photos advertise that they open bigger. */
+/* Photos that open bigger advertise it. Collection thumbnails are excluded on
+   purpose — the whole row, photo included, opens the card. */
 img.card-photo,
-.collection-card img,
 .share-card img { cursor: zoom-in; }
 
 .ai-outage-banner .control-btn {

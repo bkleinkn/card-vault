@@ -62,7 +62,7 @@ const USE_MOCK_AI = false;
 // Deploy stamp, written by scripts/stamp-version.mjs (hosting predeploy hook).
 // Compared against the page's <meta name="cv-build"> and the server's
 // version.json to detect stale installs — see enforceVersionSync().
-const BUILD = "20260721-150014-e89c84f";
+const BUILD = "20260721-161604-b4797cb";
 
 let auth, db, storage, functions, currentUser;
 
@@ -3955,12 +3955,11 @@ window.addEventListener("popstate", () => {
 document.addEventListener("click", (e) => {
   const img = e.target.closest("img");
   if (!img || !img.getAttribute("src")) return;
-  const isPhoto = img.classList.contains("card-photo");
-  const inRow = img.closest(".collection-card, .share-card");
-  if (!isPhoto && !inRow) return;
-  e.preventDefault();
-  e.stopPropagation();
-  if (isPhoto) {
+
+  // Card photos (detail + review pages): open the card's full set of sides.
+  if (img.classList.contains("card-photo")) {
+    e.preventDefault();
+    e.stopPropagation();
     // Only photos in the VISIBLE view — inactive views keep their rendered
     // DOM (display:none), and their photos must not join the Front/Back set.
     const all = [...document.querySelectorAll("img.card-photo")].filter(
@@ -3970,7 +3969,15 @@ document.addEventListener("click", (e) => {
       all.map((x) => ({ src: x.src, label: x.alt || "Photo" })),
       Math.max(0, all.indexOf(img)),
     );
-  } else {
+    return;
+  }
+
+  // Share-gallery tiles aren't links, so the photo is the only thing there is
+  // to tap. Collection thumbnails deliberately do NOT zoom — tapping anywhere
+  // in that row, photo included, opens the card.
+  if (img.closest(".share-card")) {
+    e.preventDefault();
+    e.stopPropagation();
     openImageViewer([{ src: img.src, label: img.alt || "Card" }], 0);
   }
 });
