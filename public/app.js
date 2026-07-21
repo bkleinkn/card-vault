@@ -62,7 +62,7 @@ const USE_MOCK_AI = false;
 // Deploy stamp, written by scripts/stamp-version.mjs (hosting predeploy hook).
 // Compared against the page's <meta name="cv-build"> and the server's
 // version.json to detect stale installs — see enforceVersionSync().
-const BUILD = "20260721-135606-1a7d994";
+const BUILD = "20260721-140544-ef16b81";
 
 let auth, db, storage, functions, currentUser;
 
@@ -2116,7 +2116,32 @@ function drawCollection() {
     collectionEmptyEl.hidden = true;
   }
 
-  collectionListEl.innerHTML = renderGroupedHTML(filtered);
+  // Cards that were KEPT without an identification (typically saved during an
+  // AI outage and kept anyway) are invisible to the Review view's bulk button,
+  // so offer the sweep here. Counted across the whole collection, not the
+  // current filter — a filter shouldn't hide the recovery path.
+  const unidentifiedIds = IS_DEMO ? [] : cardsCache.filter(isUnidentified).map((c) => c.id);
+  const sweepHTML = unidentifiedIds.length
+    ? `<div class="bulk-identify">
+         <button type="button" id="collection-identify-all" class="big-button primary">
+           <span aria-hidden="true">✦</span> Identify ${unidentifiedIds.length} unidentified card${unidentifiedIds.length === 1 ? "" : "s"} with AI
+         </button>
+         <p id="collection-bulk-status" class="status" aria-live="polite"></p>
+       </div>`
+    : "";
+
+  collectionListEl.innerHTML = sweepHTML + renderGroupedHTML(filtered);
+
+  const sweepBtn = document.getElementById("collection-identify-all");
+  if (sweepBtn) {
+    sweepBtn.addEventListener("click", () =>
+      identifyAllPending(unidentifiedIds, {
+        btnId: "collection-identify-all",
+        statusId: "collection-bulk-status",
+        refresh: renderCollection,
+      }),
+    );
+  }
 }
 
 // Hierarchical Manufacturer → Year → Team grouping.
@@ -2624,11 +2649,19 @@ async function renderDetail(cardId) {
 function renderDetailDisplay(el) {
   const c = detailState.card;
   const highValue = (c.valueEstimate?.high || 0) >= HIGH_VALUE_THRESHOLD;
-  const uncertain = (c.identified?.confidence || 0) < 0.5 && !c.identified?.userEdited;
+  const unidentified = !IS_DEMO && isUnidentified(c);
+  // "Not sure" nagging is pointless on a card with no identification at all —
+  // the unidentified banner below supersedes it.
+  const uncertain =
+    !unidentified && (c.identified?.confidence || 0) < 0.5 && !c.identified?.userEdited;
 
   el.innerHTML = `
     ${IS_DEMO ? `<div class="demo-banner">This is a <strong>sample item</strong>. Editing and deleting are disabled in demo mode.</div>` : ""}
     ${highValue ? `<div class="high-value-banner">This could be worth a closer look — see the Guide before you sell, clean, or grade it.</div>` : ""}
+    ${unidentified ? `
+      <div class="uncertain-banner">This card was saved without an identification — the AI never got to run on it.</div>
+      <button id="detail-ai-btn" class="big-button primary"><span aria-hidden="true">✦</span> Identify with AI</button>
+    ` : ""}
     ${uncertain ? `<div class="uncertain-banner">The AI wasn't very sure about this one. Tap <strong>Edit details</strong> to correct anything.</div>` : ""}
     <div class="result-card">
       ${identifiedSummaryHTML(c)}
@@ -2646,6 +2679,35 @@ function renderDetailDisplay(el) {
   `;
 
   if (!IS_DEMO) {
+    const aiBtn = document.getElementById("detail-ai-btn");
+    if (aiBtn) {
+      aiBtn.addEventListener("click", async () => {
+        const cardId = detailState.cardId;
+        aiBtn.disabled = true;
+        aiBtn.textContent = "Identifying…";
+        try {
+          await identifyStoredCard(cardId);
+        } catch (err) {
+          console.error("Couldn't identify stored card", err);
+          const outage = aiOutageFrom(err);
+          setAiOutage(outage);
+          showToast(
+            outage
+              ? outage.message
+              : "Couldn't identify it just now. You can edit the details by hand.",
+            { variant: "error" },
+          );
+          aiBtn.disabled = false;
+          aiBtn.innerHTML = `<span aria-hidden="true">✦</span> Identify with AI`;
+          return;
+        }
+        showToast("Identified — check the details.", { variant: "success" });
+        // Drop the cached copy so renderDetail re-reads the updated doc.
+        detailState.cardId = null;
+        detailState.card = null;
+        await renderDetail(cardId);
+      });
+    }
     document.getElementById("detail-edit-btn").addEventListener("click", () => {
       detailState.editing = true;
       renderDetail(detailState.cardId);
@@ -3038,29 +3100,45 @@ async function renderReview() {
   `;
 
   const allBtn = document.getElementById("review-identify-all");
-  if (allBtn) allBtn.addEventListener("click", () => identifyAllPending(needsId));
+  if (allBtn) {
+    allBtn.addEventListener("click", () =>
+      identifyAllPending(needsId, {
+        btnId: "review-identify-all",
+        statusId: "review-bulk-status",
+        refresh: renderReview,
+      }),
+    );
+  }
 }
 
-// Re-run identification on every pending card that has no identification yet.
-// Runs a few at a time (the server caps concurrency and daily quota anyway) and
-// stops immediately if the AI turns out to be down, so a dead API can't chew
-// through the whole pile — and the user's daily quota — one failure at a time.
-async function identifyAllPending(ids) {
-  const btn = document.getElementById("review-identify-all");
-  const statusEl = document.getElementById("review-bulk-status");
-  if (!ids.length || !btn) return;
+// Re-run identification on a batch of stored cards that have none yet. Used by
+// the Review view (pending cards) AND the Collection view (cards kept while
+// the AI was down — e.g. during the 2026-07-19 credit outage). identifyStored
+// is status-agnostic server-side, so both work the same way. Runs a few at a
+// time and stops immediately if the AI turns out to be down, so a dead API
+// can't chew through the whole pile — and the daily quota — one failure at a
+// time. `ui` = { btnId, statusId, refresh } for whichever view launched it.
+let bulkIdentifyRunning = false; // one run at a time, across all views
 
-  const origLabel = btn.innerHTML;
-  btn.disabled = true;
+async function identifyAllPending(ids, ui) {
+  if (!ids.length || bulkIdentifyRunning) return;
+  bulkIdentifyRunning = true;
+  const byId = (id) => document.getElementById(id);
+
+  const startBtn = byId(ui.btnId);
+  const origLabel = startBtn ? startBtn.innerHTML : "";
+  if (startBtn) startBtn.disabled = true;
+
   // ok = now has a real name; unreadable = the AI ran but still couldn't read
   // it; failed = the call itself errored. Kept apart so the summary can't claim
   // it identified a card that still says "Unknown".
   let next = 0, ok = 0, unreadable = 0, failed = 0, halted = false;
 
+  // Look elements up fresh each time — the view can re-render mid-run (filter
+  // changes, etc.) and replace the nodes we started with.
   const paint = () => {
-    if (statusEl) {
-      statusEl.textContent = `Identifying… ${ok + unreadable + failed} of ${ids.length} done`;
-    }
+    const el = byId(ui.statusId);
+    if (el) el.textContent = `Identifying… ${ok + unreadable + failed} of ${ids.length} done`;
   };
   paint();
 
@@ -3089,14 +3167,18 @@ async function identifyAllPending(ids) {
 
   // Three at a time mirrors the scan queue's concurrency cap.
   await Promise.all([worker(), worker(), worker()]);
+  bulkIdentifyRunning = false;
 
-  btn.disabled = false;
-  btn.innerHTML = origLabel;
+  const endBtn = byId(ui.btnId);
+  if (endBtn) {
+    endBtn.disabled = false;
+    if (origLabel) endBtn.innerHTML = origLabel;
+  }
 
   if (halted) {
-    if (statusEl) {
-      statusEl.textContent =
-        `Stopped after ${ok} of ${ids.length}. ${aiOutage ? aiOutage.message : ""}`;
+    const el = byId(ui.statusId);
+    if (el) {
+      el.textContent = `Stopped after ${ok} of ${ids.length}. ${aiOutage ? aiOutage.message : ""}`;
     }
     return;
   }
@@ -3107,8 +3189,8 @@ async function identifyAllPending(ids) {
       : `Identified all ${ok}.`,
     { variant: leftover ? "info" : "success" },
   );
-  // Reload so the rows show the new names instead of "Unidentified card".
-  await renderReview();
+  // Reload the launching view so rows show real names instead of "Unknown".
+  await ui.refresh();
 }
 
 // Short meta line for a pending card in the review list.
