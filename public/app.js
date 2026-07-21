@@ -59,10 +59,15 @@ const FIREBASE_READY = !firebaseConfig.apiKey.startsWith("REPLACE_");
 // set the ANTHROPIC_API_KEY secret and deployed the identifyCard Cloud Function.
 const USE_MOCK_AI = false;
 
+// Must match PRICE_ALGO in functions/index.js. Cards priced by an older
+// version are re-offered to the Collection's price sweep, so a fix to the
+// pricing logic reaches cards that were already priced.
+const PRICE_ALGO = 2;
+
 // Deploy stamp, written by scripts/stamp-version.mjs (hosting predeploy hook).
 // Compared against the page's <meta name="cv-build"> and the server's
 // version.json to detect stale installs — see enforceVersionSync().
-const BUILD = "20260721-163547-90919ba";
+const BUILD = "20260721-181921-c86e35c";
 
 let auth, db, storage, functions, currentUser;
 
@@ -3276,9 +3281,13 @@ async function identifyAllPending(ids, ui) {
 // that a real lookup has since happened — even one that found nothing, so a
 // card with genuinely no comps doesn't get retried forever.
 function needsPriceRefresh(c) {
-  if (!c || c.pricesRefreshedAt) return false;
-  if (c.marketPrice) return false;
-  if (c.ebayPrices && c.ebayPrices.count >= 3) return false;
+  if (!c) return false;
+  // Priced by an older, known-wrong version of the pricing logic (v1 counted
+  // eBay's loose "results matching fewer words" section as comps, which put a
+  // $3,000 median on a $2 common). Those need re-doing even though they carry
+  // a pricesRefreshedAt stamp.
+  const priced = c.pricesRefreshedAt && (c.pricesAlgo || 1) >= PRICE_ALGO;
+  if (priced) return false;
   const id = c.identified || {};
   const t = itemTypeOf(c);
   const name = t === "card" ? id.player : id.itemLabel;
@@ -4358,11 +4367,19 @@ function renderEbayBlock(ebay) {
   const median = ebay.median != null ? `$${fmt(ebay.median)}` : "—";
   const range = ebay.min != null && ebay.max != null ? `$${fmt(ebay.min)} – $${fmt(ebay.max)}` : "—";
   const link = ebay.searchUrl ? `<a href="${esc(ebay.searchUrl)}" target="_blank" rel="noopener">View on eBay &rarr;</a>` : "";
+  // One or two sales is real information but not a market — say so plainly
+  // rather than dressing a single sale up as a "median across 1 recent sales".
+  const summary =
+    ebay.count === 1
+      ? "One recent sale at this price."
+      : ebay.count === 2
+        ? `Two recent sales. Range ${range}.`
+        : `Median across ${ebay.count} recent sales. Range ${range}.`;
   return `
     <div class="value-block ebay-block">
       <div class="label muted">eBay sold (recent)</div>
       <div class="range">${median}</div>
-      <div class="note">Median across ${ebay.count} recent sales. Range ${range}. Mixed conditions — may include graded cards.<br/>${link}</div>
+      <div class="note">${summary} Mixed conditions — may include graded cards.<br/>${link}</div>
     </div>
   `;
 }

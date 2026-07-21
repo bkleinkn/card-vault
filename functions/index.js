@@ -397,14 +397,23 @@ async function identifyImages(frontImageBase64, backImageBase64, type) {
   // Real recent sold prices as a second source, replacing the model's guess.
   const query = buildPriceQuery(parsed.identified, type);
   if (query) {
-    const prices = await lookupPrices(query);
+    const prices = await lookupPrices(query, buildRelevance(parsed.identified, type));
     if (prices.marketPrice) parsed.marketPrice = prices.marketPrice;
     if (prices.triedEbay) parsed.ebayPrices = prices.ebayPrices;
     if (prices.valueEstimate) parsed.valueEstimate = prices.valueEstimate;
+    parsed.pricesRefreshedAt = new Date().toISOString();
+    parsed.pricesAlgo = PRICE_ALGO;
   }
 
   return parsed;
 }
+
+// Bump when the pricing logic changes in a way that makes stored numbers
+// wrong. The client re-offers its sweep for any card below the current
+// version, so a fix reaches cards that were already priced.
+//   1 = original (counted eBay's loose "fewer words" section as comps)
+//   2 = title-matched, outlier-trimmed, foreign-currency guarded
+const PRICE_ALGO = 2;
 
 // The free-text search that stands in for "this exact item" at the price
 // sources. Null when the item isn't identified well enough to search for —
@@ -425,11 +434,33 @@ function buildPriceQuery(identified, type) {
   return query.trim() ? query : null;
 }
 
+// What a sold listing's TITLE must mention for it to count as this item's comp.
+// The surname alone is the workhorse: set names vary wildly in listings ("The
+// Sporting News All-Time All-Stars" is written a dozen ways) but the player's
+// last name and the year are nearly always present.
+function buildRelevance(identified, type) {
+  const ident = identified || {};
+  const name = type === "card" ? ident.player : ident.itemLabel;
+  const words = String(name || "")
+    .replace(/[^A-Za-z\s'-]/g, " ")
+    .trim()
+    .split(/\s+/)
+    .filter(Boolean);
+  // Skip generational suffixes so "Ken Griffey Jr." matches on "griffey".
+  const meaningful = words.filter((w) => !/^(jr|sr|ii|iii|iv)\.?$/i.test(w));
+  const lastName = meaningful.length ? meaningful[meaningful.length - 1] : "";
+  return {
+    year: ident.year || "",
+    // One-word labels (packs/boxes) are too generic to require; a surname isn't.
+    lastName: type === "card" && lastName.length >= 3 ? lastName : "",
+  };
+}
+
 // Price an already-identified item. Returns { marketPrice, ebayPrices,
 // valueEstimate, triedEbay } — any of the first three null when that source had
 // nothing to say. No model call, so this is free apart from the proxy request:
 // identifyImages uses it on fresh scans, refreshPrices re-runs it later.
-async function lookupPrices(query) {
+async function lookupPrices(query, want = {}) {
   const out = { marketPrice: null, ebayPrices: null, valueEstimate: null, triedEbay: false };
 
   // Prefer a real market price. Only fall back to the eBay scrape when no
@@ -454,21 +485,26 @@ async function lookupPrices(query) {
   if (scpToken()) return out;
 
   out.triedEbay = true;
-  const ebay = await fetchEbaySoldPrices(query);
+  const ebay = await fetchEbaySoldPrices(query, want);
   out.ebayPrices = ebay;
-  // Real sold prices beat the model's recollection. Require a few comps —
-  // one or two are noise, and eBay results mix in graded copies, lots, and
-  // near-miss variants, so the median is an approximation, not a quote.
-  if (ebay && ebay.count >= 3 && ebay.median > 0) {
-    // Whole dollars — a ±30% band is an approximation, and "$836.5" reads
-    // as broken precision to the person deciding whether to keep the card.
+  // Any real sale of THIS card beats the model's recollection, which is why
+  // one comp still anchors the estimate — a 1976 common the model guessed at
+  // $2,000 had exactly one sold listing, at $2.50. Thin data gets a wider band
+  // and says so, because a single sale can be an odd copy or a bad day.
+  if (ebay && ebay.count >= 1 && ebay.median > 0) {
+    const thin = ebay.count < 3;
+    const spread = thin ? 0.45 : 0.3;
+    const shown = ebay.median.toLocaleString("en-US", { maximumFractionDigits: 2 });
+    // Whole dollars — a band is an approximation, and "$836.5" reads as broken
+    // precision to the person deciding whether to keep the card.
     out.valueEstimate = {
-      low: Math.max(1, Math.round(ebay.median * 0.7)),
-      high: Math.max(1, Math.round(ebay.median * 1.3)),
-      note:
-        `Based on ${ebay.count} recent eBay sold listings ` +
-        `(median $${ebay.median.toLocaleString("en-US", { maximumFractionDigits: 2 })}). ` +
-        `Check the listings yourself for condition.`,
+      low: Math.max(1, Math.round(ebay.median * (1 - spread))),
+      high: Math.max(1, Math.round(ebay.median * (1 + spread))),
+      note: thin
+        ? `Based on only ${ebay.count === 1 ? "one recent eBay sale" : `${ebay.count} recent eBay sales`} ` +
+          `($${shown}) — thin data, so treat it as a rough marker.`
+        : `Based on ${ebay.count} recent eBay sold listings (median $${shown}). ` +
+          `Check the listings yourself for condition.`,
       estimatedAt: new Date().toISOString(),
       source: "ebay_sold",
     };
@@ -539,6 +575,9 @@ exports.identifyStored = onCall(
           ebayPrices: parsed.ebayPrices || null,
           marketPrice: parsed.marketPrice || null,
           needsIdentify: false,
+          ...(parsed.pricesAlgo
+            ? { pricesRefreshedAt: parsed.pricesRefreshedAt, pricesAlgo: parsed.pricesAlgo }
+            : {}),
         },
         { merge: true },
       );
@@ -600,9 +639,9 @@ exports.refreshPrices = onCall(
         );
       }
 
-      const prices = await lookupPrices(query);
+      const prices = await lookupPrices(query, buildRelevance(card.identified, type));
 
-      const update = { pricesRefreshedAt: new Date().toISOString() };
+      const update = { pricesRefreshedAt: new Date().toISOString(), pricesAlgo: PRICE_ALGO };
       if (prices.marketPrice) update.marketPrice = prices.marketPrice;
       if (prices.triedEbay) update.ebayPrices = prices.ebayPrices;
 
@@ -827,58 +866,122 @@ async function fetchMarketPrice(query) {
   };
 }
 
+// eBay pads a thin result set with a "Results matching fewer words" section of
+// loosely-related items. Those are NOT comps for this card: a 1976 Topps common
+// with one real $2.50 sale came back with 59 unrelated listings behind that
+// divider, and their median said $3,184.97 (2026-07-21). Everything from the
+// divider on is cut before parsing.
+const EBAY_LOOSE_MATCH_MARKERS = [
+  "Results matching fewer words",
+  "Results matching fewer keywords",
+];
+
+// No single trading card in scope sells for this. A price above it means the
+// page wasn't in US dollars (a non-US proxy exit renders local currency with a
+// bare "$": five cards in the 2026-07-21 sweep came back scaled by ~1000×).
+const NOT_A_CARD_PRICE = 50000;
+
+// Strip HTML entities/tags out of a title so matching sees plain words.
+function plainText(s) {
+  return String(s || "")
+    .replace(/<[^>]*>/g, " ")
+    .replace(/&amp;/g, "&")
+    .replace(/&#0?39;|&apos;/g, "'")
+    .replace(/&quot;/g, '"')
+    .replace(/&nbsp;/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
 // Pure, side-effect-free parser: turn an eBay sold-listings HTML page into
-// price stats. Returns { count: 0 } when no usable prices are found, otherwise
-// { median, min, max, count } rounded to cents. Best-effort by design.
-function parseEbaySoldHtml(html, maxResults = 60) {
-  const text = String(html || "");
+// price stats for ONE card. Returns { count: 0 } when nothing usable matched,
+// otherwise { median, min, max, count } rounded to cents.
+//
+// `want` = { year, lastName } from the identification. A listing only counts
+// when its own title mentions them — without that check the median is computed
+// over whatever eBay felt like showing, which is how a $1-$3 common ended up
+// priced at $3,184.97. Best-effort by design: when the markup stops parsing we
+// report zero comps (and log), never a number we can't stand behind.
+function parseEbaySoldHtml(html, want = {}, maxResults = 60) {
+  let text = String(html || "");
 
-  // Current (2026) results layout: each card's price span carries both
-  // su-styled-text and s-card__price classes. Only "positive" (green) prices
-  // are genuine SOLD amounts — sponsored and active listings mixed into the
-  // page render "primary" (black), and counting those would poison the median
-  // with exactly the asking prices this feature exists to escape.
-  let prices = [
-    ...text.matchAll(
-      /<span class="(?=[^"]*\bpositive\b)(?=[^"]*\bs-card__price\b)[^"]*">[^<]*?\$([\d,]+(?:\.\d{2})?)/g,
-    ),
-  ]
-    .map((m) => parseFloat(m[1].replace(/,/g, "")))
-    .filter((p) => !isNaN(p) && p > 0);
-
-  if (prices.length === 0) {
-    // Pre-2026 layout fallback, in case eBay still serves the old template to
-    // some sessions. Its first row is frequently a stale "Shop on eBay"
-    // placeholder price, so drop it when there's enough data to spare one.
-    prices = [
-      ...text.matchAll(
-        /<span class="s-item__price">[^<]*?\$([\d,]+(?:\.\d{2})?)[^<]*?<\/span>/g,
-      ),
-    ]
-      .map((m) => parseFloat(m[1].replace(/,/g, "")))
-      .filter((p) => !isNaN(p) && p > 0);
-    if (prices.length > 3) {
-      prices = prices.slice(1);
+  for (const marker of EBAY_LOOSE_MATCH_MARKERS) {
+    const cut = text.indexOf(marker);
+    if (cut > 0) {
+      text = text.slice(0, cut);
+      break;
     }
   }
 
-  prices = prices.slice(0, maxResults);
-
-  if (prices.length === 0) {
-    return { count: 0 };
+  // Result cards render title then price. Collect both with their positions so
+  // each price can be attributed to the listing it belongs to. The class
+  // attribute is unquoted in eBay's current markup (class=s-card__title).
+  const titles = [];
+  const titleRe = /class=["']?s-card__title["']?[^>]*>\s*(?:<span[^>]*>)?([^<]{3,300})/g;
+  let m;
+  while ((m = titleRe.exec(text))) {
+    titles.push({ pos: m.index, text: plainText(m[1]).toLowerCase() });
   }
 
+  // Only "positive" (green) prices are genuine SOLD amounts — sponsored and
+  // active listings mixed into the page render "primary" (black), and counting
+  // those would poison the median with the asking prices this feature exists
+  // to escape.
+  const priceRe = /<span class="(?=[^"]*\bpositive\b)(?=[^"]*\bs-card__price\b)[^"]*">([^<]{1,60})</g;
+  const wantYear = want.year ? String(want.year) : "";
+  const wantName = (want.lastName || "").toLowerCase();
+
+  const prices = [];
+  let ti = 0;
+  let lastTitle = null;
+  while ((m = priceRe.exec(text))) {
+    while (ti < titles.length && titles[ti].pos < m.index) lastTitle = titles[ti++];
+    if (!lastTitle) continue;
+    const title = lastTitle.text;
+    if (title.startsWith("shop on ebay")) continue;
+    if (wantName && !title.includes(wantName)) continue;
+    if (wantYear && !title.includes(wantYear)) continue;
+
+    const raw = m[1].trim();
+    // A letter before the "$" means a foreign currency (C $, AU $, MX $).
+    if (/[A-Za-z]\s*\$/.test(raw)) continue;
+    // Multi-variant listings render "$10.00 to $50.00" — take the low end.
+    const num = raw.match(/\$([\d,]+(?:\.\d{1,2})?)/);
+    if (!num) continue;
+    const value = parseFloat(num[1].replace(/,/g, ""));
+    if (!Number.isFinite(value) || value <= 0 || value > NOT_A_CARD_PRICE) continue;
+    prices.push(value);
+    if (prices.length >= maxResults) break;
+  }
+
+  if (prices.length === 0) return { count: 0 };
+
   prices.sort((a, b) => a - b);
-  const median = prices[Math.floor(prices.length / 2)];
-  const min = prices[0];
-  const max = prices[prices.length - 1];
+  const trimmed = dropOutliers(prices);
+  const median = trimmed[Math.floor(trimmed.length / 2)];
 
   return {
     median: Math.round(median * 100) / 100,
-    min: Math.round(min * 100) / 100,
-    max: Math.round(max * 100) / 100,
-    count: prices.length,
+    min: Math.round(trimmed[0] * 100) / 100,
+    max: Math.round(trimmed[trimmed.length - 1] * 100) / 100,
+    count: trimmed.length,
   };
+}
+
+// Drop values outside 1.5×IQR. Sold results still mix in graded slabs, lots,
+// and complete sets whose prices are orders of magnitude off a raw single; the
+// median resists those but min/max — which the UI shows as the range — do not.
+// Needs enough data to have a shape: below 6 values, keep them all.
+function dropOutliers(sorted) {
+  if (sorted.length < 6) return sorted;
+  const at = (frac) => sorted[Math.min(sorted.length - 1, Math.floor(sorted.length * frac))];
+  const q1 = at(0.25);
+  const q3 = at(0.75);
+  const iqr = q3 - q1;
+  const lo = q1 - 1.5 * iqr;
+  const hi = q3 + 1.5 * iqr;
+  const kept = sorted.filter((p) => p >= lo && p <= hi);
+  return kept.length >= 3 ? kept : sorted;
 }
 
 // Scrape eBay's sold-listings page for the given free-text query and return
@@ -900,7 +1003,7 @@ function ebayProxyTemplate() {
   return t;
 }
 
-async function fetchEbaySoldPrices(query, maxResults = 60) {
+async function fetchEbaySoldPrices(query, want = {}, maxResults = 60) {
   // The real eBay URL. This is what gets STORED and shown to the user — never
   // the proxied one, which carries the provider's API key in its query string.
   const searchUrl = `https://www.ebay.com/sch/i.html?_nkw=${encodeURIComponent(query)}&LH_Sold=1&LH_Complete=1&_ipg=${maxResults}`;
@@ -937,11 +1040,13 @@ async function fetchEbaySoldPrices(query, maxResults = 60) {
     }
     const html = await response.text();
 
-    const stats = parseEbaySoldHtml(html, maxResults);
+    const stats = parseEbaySoldHtml(html, want, maxResults);
     // One success line so "is the proxy working?" is answerable from the logs
-    // alone — failures already log their status and mode above.
+    // alone — failures already log their status and mode above. `matched` vs
+    // the raw page size is the signal that the relevance filter is doing its
+    // job (and, if it ever reads 0 across the board, that eBay changed markup).
     console.log(
-      `eBay comps: ${stats.count} for query "${query}"` +
+      `eBay comps: ${stats.count} matched for query "${query}"` +
         (template ? " (via proxy)" : " (direct)"),
     );
     if (stats.count === 0) {
