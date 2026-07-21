@@ -1170,13 +1170,17 @@ exports.getSharedCollection = onCall(
         })
         .slice(0, SHARE_MAX_CARDS)
         // Privacy: expose only display fields. No values, notes, locations, or
-        // timestamps reach the public view.
+        // timestamps reach the public view. This is a whitelist on purpose —
+        // fields added to cards later can't start leaking by default.
         .map((c) => ({
           id: c.id,
           itemType: c.itemType === "pack" || c.itemType === "box" ? c.itemType : "card",
           identified: c.identified,
           imageFrontUrl: c.imageFrontUrl,
           imageBackUrl: c.imageBackUrl,
+          // Which way is up — otherwise a photo the owner straightened still
+          // shows sideways to the recipient, who can't fix it.
+          rotation: c.rotation || null,
         }));
 
       return { cards, count: cards.length };

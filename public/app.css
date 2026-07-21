@@ -2367,6 +2367,88 @@ body.cv-viewer-open { overflow: hidden; }
 img.card-photo,
 .share-card img { cursor: zoom-in; }
 
+/* ---------- Saved photo rotation ----------
+   A card photographed sideways is rotated once and stays rotated everywhere.
+   A CSS transform doesn't change the element's layout box, so a quarter turn
+   inside a fixed 5/7 frame needs a scale to match: frames filled with
+   object-fit:cover must scale UP by 7/5 to keep covering, frames using
+   object-fit:contain must scale DOWN by 5/7 to keep fitting. Half turns need
+   neither. The viewer computes its own fit in JS (free-floating image). */
+img.rot-180 { transform: rotate(180deg); }
+
+.collection-card img.rot-90,
+.share-card img.rot-90 { transform: rotate(90deg) scale(1.4); }
+.collection-card img.rot-270,
+.share-card img.rot-270 { transform: rotate(270deg) scale(1.4); }
+
+/* Detail/review photos sit in a fixed frame so a rotated one can't overlap the
+   controls around it — a transform would otherwise paint outside its box. */
+.photo-frame {
+  position: relative;
+  width: 100%;
+  max-width: 360px;
+  aspect-ratio: 5/7;
+  margin: 12px auto;
+  border-radius: var(--radius);
+  border: 1px solid var(--border);
+  background: var(--surface);
+  overflow: hidden;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.photo-frame img {
+  max-width: 100%;
+  max-height: 100%;
+  width: auto;
+  height: auto;
+  object-fit: contain;
+  display: block;
+  margin: 0;
+  border: 0;
+  border-radius: 0;
+}
+
+.photo-frame img.rot-90  { transform: rotate(90deg)  scale(0.714); }
+.photo-frame img.rot-270 { transform: rotate(270deg) scale(0.714); }
+
+.photo-frame-label {
+  position: absolute;
+  top: 8px;
+  left: 10px;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--ink-faint);
+  background: rgba(2, 6, 23, 0.7);
+  padding: 3px 8px;
+  border-radius: var(--radius-pill);
+  pointer-events: none;
+}
+
+/* Rotate control, in the viewer's bottom bar next to the Front/Back chips. */
+.cv-viewer-rotate {
+  min-height: var(--tap);
+  padding: 8px 18px;
+  border-radius: var(--radius-pill);
+  border: 1px solid var(--border-strong);
+  background: rgba(15, 23, 42, 0.85);
+  color: var(--ink-2);
+  font-size: 14px;
+  font-weight: 600;
+  font-family: inherit;
+  cursor: pointer;
+}
+
+.cv-viewer-rotate:hover {
+  border-color: var(--accent);
+  color: var(--ink);
+}
+
+.cv-viewer-rotate[disabled] { opacity: .6; cursor: default; }
+
 .ai-outage-banner .control-btn {
   align-self: flex-start;
 }

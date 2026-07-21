@@ -67,7 +67,7 @@ const PRICE_ALGO = 2;
 // Deploy stamp, written by scripts/stamp-version.mjs (hosting predeploy hook).
 // Compared against the page's <meta name="cv-build"> and the server's
 // version.json to detect stale installs — see enforceVersionSync().
-const BUILD = "20260721-181921-c86e35c";
+const BUILD = "20260721-190040-48a3a7d";
 
 let auth, db, storage, functions, currentUser;
 
@@ -2257,7 +2257,7 @@ function renderGroupedHTML(cards) {
                               .map(
                                 (c) => `
                               <a class="collection-card" href="#/detail/${esc(c.id)}">
-                                <img src="${esc(c.imageFrontUrl || "")}" alt="${esc(displayName(c))}" />
+                                <img class="${rotClass(rotationOf(c, "front")).trim()}" src="${esc(c.imageFrontUrl || "")}" alt="${esc(displayName(c))}" />
                                 <div class="info">
                                   <div class="name">${esc(displayName(c))}</div>
                                   <div class="sub">${collectionCardSub(c)}</div>
@@ -2586,7 +2586,7 @@ function renderSharedTile(card) {
 
   return `
     <div class="share-card">
-      <img src="${esc(c.imageFrontUrl || "")}" alt="${esc(name)}" loading="lazy" />
+      <img class="${rotClass(rotationOf(c, "front")).trim()}" src="${esc(c.imageFrontUrl || "")}" alt="${esc(name)}" loading="lazy" />
       <div class="info">
         <div class="name">${esc(name)}</div>
         ${meta ? `<div class="sub">${esc(meta)}</div>` : ""}
@@ -2724,8 +2724,8 @@ function renderDetailDisplay(el) {
     ${c.userNotes ? `<div class="notes-display">${esc(c.userNotes)}</div>` : ""}
     ${ebaySectionHTML(c)}
     ${IS_DEMO ? "" : `<div class="row"><button id="detail-edit-btn" class="big-button">Edit details &amp; notes</button></div>`}
-    ${c.imageFrontUrl ? `<img class="card-photo" src="${esc(c.imageFrontUrl)}" alt="Front" />` : ""}
-    ${c.imageBackUrl ? `<img class="card-photo" src="${esc(c.imageBackUrl)}" alt="Back" />` : ""}
+    ${photoFrameHTML(c, "front")}
+    ${photoFrameHTML(c, "back")}
     ${IS_DEMO ? "" : `<button id="delete-btn" class="big-button" style="color:var(--danger);">Remove from collection</button>`}
   `;
 
@@ -3458,8 +3458,8 @@ function renderReviewDisplay() {
       ${resultBody}
     </div>
     ${c.locationId && locationName(c.locationId) ? `<div class="location-display"><span aria-hidden="true">📍</span> <strong>Location:</strong> ${esc(locationName(c.locationId))}</div>` : ""}
-    ${c.imageFrontUrl ? `<img class="card-photo" src="${esc(c.imageFrontUrl)}" alt="Front" />` : ""}
-    ${c.imageBackUrl ? `<img class="card-photo" src="${esc(c.imageBackUrl)}" alt="Back" />` : ""}
+    ${photoFrameHTML(c, "front")}
+    ${photoFrameHTML(c, "back")}
     <div class="row">
       <button id="review-keep-btn" class="big-button primary">Keep in collection</button>
       <button id="review-discard-btn" class="big-button">Discard</button>
@@ -3889,11 +3889,28 @@ const viewerState = {
   pinch: null,     // { dist, scale, mid } while two fingers are down
   lastTap: null,   // { t, x, y } for double-tap detection
   historyArmed: false,
+  cardId: null,    // owner's card being viewed (null in the share gallery)
 };
+
+// A quarter-turned image keeps its layout box, so it would overflow the stage
+// unless we shrink it to the box it now occupies. Height and width swap, hence
+// comparing each against the opposite limit.
+function viewerFitScale() {
+  const v = viewerState;
+  const rot = v.items[v.index] ? v.items[v.index].rotation || 0 : 0;
+  if (rot !== 90 && rot !== 270) return 1;
+  const w = v.img.offsetWidth;
+  const h = v.img.offsetHeight;
+  if (!w || !h) return 1;
+  const stage = v.stage.getBoundingClientRect();
+  return Math.min(1, (stage.width * 0.94) / h, (stage.height * 0.86) / w);
+}
 
 function viewerApplyTransform() {
   const v = viewerState;
-  v.img.style.transform = `translate(${v.tx}px, ${v.ty}px) scale(${v.scale})`;
+  const rot = v.items[v.index] ? v.items[v.index].rotation || 0 : 0;
+  const s = v.scale * viewerFitScale();
+  v.img.style.transform = `translate(${v.tx}px, ${v.ty}px) rotate(${rot}deg) scale(${s})`;
   v.stage.classList.toggle("cv-zoomed", v.scale > 1.01);
 }
 
@@ -3929,6 +3946,33 @@ function viewerClampPan() {
   v.ty = Math.min(halfH, Math.max(-halfH, v.ty));
 }
 
+// Turn the photo a quarter turn and remember it. Applied optimistically so the
+// image moves under the finger; a failed write is reported and rolled back.
+async function rotateViewedPhoto() {
+  const v = viewerState;
+  const item = v.items[v.index];
+  if (!item || !v.cardId || !item.side) return;
+  const before = item.rotation || 0;
+  const after = (before + 90) % 360;
+  item.rotation = after;
+  viewerApplyTransform();
+  v.rotateBtn.disabled = true;
+  try {
+    await saveRotation(v.cardId, item.side, after);
+    // Turn the copy behind the viewer too, so closing doesn't snap it back.
+    document
+      .querySelectorAll(`img.card-photo[data-side="${item.side}"]`)
+      .forEach((el) => { el.className = `card-photo${rotClass(after)}`; });
+  } catch (err) {
+    console.error("Couldn't save rotation", err);
+    item.rotation = before;
+    viewerApplyTransform();
+    showToast("Couldn't save the rotation. Try again.", { variant: "error" });
+  } finally {
+    v.rotateBtn.disabled = false;
+  }
+}
+
 function viewerSetSide(i) {
   const v = viewerState;
   if (!v.items[i]) return;
@@ -3938,6 +3982,9 @@ function viewerSetSide(i) {
   v.ty = 0;
   v.img.src = v.items[i].src;
   v.img.alt = v.items[i].label;
+  // Rotating is the owner's action on their own card — a share-link visitor
+  // has nothing to save to.
+  v.rotateBtn.hidden = !(v.cardId && v.items[i].side);
   viewerApplyTransform();
   if (v.items.length > 1) {
     v.sides.hidden = false;
@@ -4051,6 +4098,7 @@ function ensureViewerDom() {
     <button type="button" class="cv-viewer-close" aria-label="Close photo viewer">&times;</button>
     <div class="cv-viewer-bar">
       <div class="cv-viewer-sides" hidden></div>
+      <button type="button" class="cv-viewer-rotate" hidden>&#8635; Rotate</button>
       <div class="cv-viewer-hint">Pinch, scroll, or double-tap to zoom</div>
     </div>
   `;
@@ -4059,7 +4107,12 @@ function ensureViewerDom() {
   v.stage = el.querySelector(".cv-viewer-stage");
   v.img = el.querySelector(".cv-viewer-img");
   v.sides = el.querySelector(".cv-viewer-sides");
+  v.rotateBtn = el.querySelector(".cv-viewer-rotate");
 
+  v.rotateBtn.addEventListener("click", rotateViewedPhoto);
+  // offsetWidth/Height are 0 until the image has loaded, so the rotated-fit
+  // scale can only be computed once it has.
+  v.img.addEventListener("load", viewerApplyTransform);
   el.querySelector(".cv-viewer-close").addEventListener("click", closeImageViewer);
   v.sides.addEventListener("click", (e) => {
     const btn = e.target.closest("[data-side]");
@@ -4081,10 +4134,11 @@ function ensureViewerDom() {
   el.addEventListener("gesturestart", (e) => e.preventDefault());
 }
 
-function openImageViewer(items, index = 0) {
+function openImageViewer(items, index = 0, opts = {}) {
   ensureViewerDom();
   const v = viewerState;
   v.items = items;
+  v.cardId = opts.cardId || null;
   v.pointers.clear();
   v.pinch = null;
   v.lastTap = null;
@@ -4142,9 +4196,22 @@ document.addEventListener("click", (e) => {
     const all = [...document.querySelectorAll("img.card-photo")].filter(
       (x) => x.getAttribute("src") && x.offsetParent !== null,
     );
+    // Whichever card page is on screen owns these photos.
+    const hash = location.hash || "";
+    const cardId = hash.startsWith("#/review/")
+      ? reviewState.cardId
+      : hash.startsWith("#/detail/")
+        ? detailState.cardId
+        : null;
     openImageViewer(
-      all.map((x) => ({ src: x.src, label: x.alt || "Photo" })),
+      all.map((x) => ({
+        src: x.src,
+        label: x.alt || "Photo",
+        side: x.dataset.side || "",
+        rotation: (x.className.match(/rot-(\d+)/) || [])[1] * 1 || 0,
+      })),
       Math.max(0, all.indexOf(img)),
+      { cardId },
     );
     return;
   }
@@ -4155,7 +4222,16 @@ document.addEventListener("click", (e) => {
   if (img.closest(".share-card")) {
     e.preventDefault();
     e.stopPropagation();
-    openImageViewer([{ src: img.src, label: img.alt || "Card" }], 0);
+    // Carry the tile's rotation into the viewer, or the recipient zooms a
+    // photo that snaps back to sideways. No side/cardId: they can't re-save it.
+    openImageViewer(
+      [{
+        src: img.src,
+        label: img.alt || "Card",
+        rotation: (img.className.match(/rot-(\d+)/) || [])[1] * 1 || 0,
+      }],
+      0,
+    );
   }
 });
 
@@ -4357,6 +4433,54 @@ function esc(s) {
 
 function fmt(n) {
   return Number(n || 0).toLocaleString("en-US");
+}
+
+// --- Saved photo rotation --------------------------------------------------
+// Cards photographed sideways stay sideways otherwise — including in a share
+// link, where the recipient can't fix anything. The angle is stored per side
+// (rotation: { front, back }) and applied as a CSS class wherever the photo is
+// drawn; the image bytes in Storage are never touched, so rotating is instant,
+// free, and reversible.
+function rotationOf(card, side) {
+  const deg = Number(card && card.rotation && card.rotation[side]);
+  return Number.isFinite(deg) ? ((deg % 360) + 360) % 360 : 0;
+}
+
+// "" for upright so unrotated photos carry no extra class.
+function rotClass(deg) {
+  const d = ((Number(deg) || 0) % 360 + 360) % 360;
+  return d === 90 || d === 180 || d === 270 ? ` rot-${d}` : "";
+}
+
+// One detail/review photo in its frame. The frame reserves the space so a
+// rotated photo can't paint over the buttons around it.
+function photoFrameHTML(card, side) {
+  const url = side === "back" ? card.imageBackUrl : card.imageFrontUrl;
+  if (!url) return "";
+  const label = side === "back" ? "Back" : "Front";
+  return `
+    <div class="photo-frame">
+      <img class="card-photo${rotClass(rotationOf(card, side))}" src="${esc(url)}" alt="${label}" data-side="${side}" />
+      <span class="photo-frame-label">${label}</span>
+    </div>`;
+}
+
+// Persist a rotation. Merges into rotation.{side} so the other side is left
+// alone, and updates the in-memory copies the open views are rendering from.
+async function saveRotation(cardId, side, deg) {
+  if (!currentUser || IS_DEMO || !cardId) return;
+  await setDoc(
+    doc(db, "users", currentUser.uid, "cards", cardId),
+    { rotation: { [side]: deg } },
+    { merge: true },
+  );
+  for (const st of [detailState, reviewState]) {
+    if (st.cardId === cardId && st.card) {
+      st.card.rotation = { ...(st.card.rotation || {}), [side]: deg };
+    }
+  }
+  const cached = cardsCache.find((c) => c.id === cardId);
+  if (cached) cached.rotation = { ...(cached.rotation || {}), [side]: deg };
 }
 
 // Render the eBay sold-listings block. Returns "" if no data so the result
