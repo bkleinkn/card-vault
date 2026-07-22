@@ -67,7 +67,7 @@ const PRICE_ALGO = 2;
 // Deploy stamp, written by scripts/stamp-version.mjs (hosting predeploy hook).
 // Compared against the page's <meta name="cv-build"> and the server's
 // version.json to detect stale installs — see enforceVersionSync().
-const BUILD = "20260721-192107-e3be7b8";
+const BUILD = "20260722-001857-aa51609";
 
 let auth, db, storage, functions, currentUser;
 
@@ -2052,6 +2052,25 @@ async function renderCollection() {
   drawCollection();
 }
 
+// Sorts that gather cards into runs (by team, by brand). Blanks go last — a
+// sealed pack has no team, and burying those under the A's would look broken —
+// and within a run, year then player keeps the order readable instead of
+// arbitrary. Shared by the owner's collection and the public share view.
+function groupSort(key) {
+  return (a, b) => {
+    const av = String(key(a) || "").trim();
+    const bv = String(key(b) || "").trim();
+    if (!av !== !bv) return av ? -1 : 1;
+    const byValue = av.localeCompare(bv);
+    if (byValue) return byValue;
+    const byYear = (a.identified?.year || 0) - (b.identified?.year || 0);
+    if (byYear) return byYear;
+    return (a.identified?.player || a.identified?.itemLabel || "").localeCompare(
+      b.identified?.player || b.identified?.itemLabel || "",
+    );
+  };
+}
+
 const sortComparators = {
   newest: (a, b) => tsMs(b.createdAt) - tsMs(a.createdAt),
   oldest: (a, b) => tsMs(a.createdAt) - tsMs(b.createdAt),
@@ -2067,6 +2086,8 @@ const sortComparators = {
     (a.identified?.player || a.identified?.itemLabel || "").localeCompare(
       b.identified?.player || b.identified?.itemLabel || "",
     ),
+  "team-az": groupSort((c) => c.identified?.team),
+  "set-az": groupSort((c) => c.identified?.set),
 };
 
 function applyFiltersAndSort(cards) {
@@ -2512,6 +2533,49 @@ const shareViewContentEl = document.getElementById("share-view-content");
 // The cards behind the currently-open share link. The grid renders fronts, so
 // the viewer needs this to find the matching back when a tile is tapped.
 let sharedCardsCache = [];
+let shareToken = null;
+
+// A recipient can straighten a sideways photo for their own viewing, but it
+// isn't their collection — there's nothing to save it to, and the owner's card
+// must not change. So the angle is remembered locally, per share link, and
+// never leaves the device.
+const SHARE_ROT_KEY = "cv-share-rotations";
+
+function shareRotStore() {
+  try {
+    return JSON.parse(localStorage.getItem(SHARE_ROT_KEY) || "{}");
+  } catch {
+    return {};
+  }
+}
+
+function localRotation(cardId, side) {
+  if (!shareToken || !cardId || !side) return null;
+  const deg = shareRotStore()[`${shareToken}:${cardId}:${side}`];
+  return typeof deg === "number" ? deg : null;
+}
+
+function setLocalRotation(cardId, side, deg) {
+  if (!shareToken || !cardId || !side) return;
+  try {
+    const store = shareRotStore();
+    const key = `${shareToken}:${cardId}:${side}`;
+    // Upright is the default, so don't keep a record of it.
+    if (deg) store[key] = deg;
+    else delete store[key];
+    localStorage.setItem(SHARE_ROT_KEY, JSON.stringify(store));
+  } catch {
+    // Private browsing or a full quota: the rotation still applies on screen,
+    // it just won't survive a reload. Not worth interrupting anyone over.
+  }
+}
+
+// How to draw a shared photo: the recipient's own adjustment if they made one,
+// otherwise however the owner saved it.
+function sharedRotation(card, side) {
+  const local = localRotation(card && card.id, side);
+  return local === null ? rotationOf(card, side) : local;
+}
 
 async function renderSharedView(token) {
   if (!shareViewContentEl) return;
@@ -2524,6 +2588,9 @@ async function renderSharedView(token) {
     return;
   }
 
+  // Keyed per link, so rotations a recipient makes on one shared collection
+  // don't bleed into another.
+  shareToken = token;
   shareViewContentEl.innerHTML = `<p class="muted">Loading shared collection…</p>`;
   let data;
   try {
@@ -2616,6 +2683,8 @@ function shareControlsHTML(cards) {
         <option value="oldest-cards">Oldest cards (year)</option>
         <option value="newest-cards">Newest cards (year)</option>
         <option value="player-az">Player A&ndash;Z</option>
+        <option value="team-az">Team A&ndash;Z</option>
+        <option value="set-az">Brand A&ndash;Z (Topps, Bowman&hellip;)</option>
       </select>
       <button id="share-filters-toggle" type="button" class="control-btn"
               aria-controls="share-filters-panel" aria-expanded="false">Filters</button>
@@ -2735,6 +2804,8 @@ function applyShareFilters(cards) {
       (a.identified?.player || a.identified?.itemLabel || "").localeCompare(
         b.identified?.player || b.identified?.itemLabel || "",
       ),
+    "team-az": groupSort((c) => c.identified?.team),
+    "set-az": groupSort((c) => c.identified?.set),
   }[f.sort] || ((a, b) => a.__order - b.__order);
 
   return filtered.slice().sort(cmp);
@@ -2802,7 +2873,7 @@ function renderSharedTile(card) {
   return `
     <div class="share-card" data-card-id="${esc(c.id || "")}">
       <div class="share-card-photo">
-        <img class="${rotClass(rotationOf(c, "front")).trim()}" src="${esc(c.imageFrontUrl || "")}" alt="${esc(name)}" loading="lazy" />
+        <img class="${rotClass(sharedRotation(c, "front")).trim()}" src="${esc(c.imageFrontUrl || "")}" alt="${esc(name)}" loading="lazy" />
         ${hasBack ? `<span class="share-card-flip">Front + back</span>` : ""}
       </div>
       <div class="info">
@@ -4107,7 +4178,11 @@ const viewerState = {
   pinch: null,     // { dist, scale, mid } while two fingers are down
   lastTap: null,   // { t, x, y } for double-tap detection
   historyArmed: false,
-  cardId: null,    // owner's card being viewed (null in the share gallery)
+  cardId: null,    // the card being viewed, when there is one
+  // "save"  — the owner's own card: rotation is written to Firestore
+  // "local" — a share link: rotation is remembered on this device only
+  // "none"  — nothing to rotate against; the button stays hidden
+  rotateMode: "none",
 };
 
 // A quarter-turned image keeps its layout box, so it would overflow the stage
@@ -4169,11 +4244,23 @@ function viewerClampPan() {
 async function rotateViewedPhoto() {
   const v = viewerState;
   const item = v.items[v.index];
-  if (!item || !v.cardId || !item.side) return;
+  if (!item || !v.cardId || !item.side || v.rotateMode === "none") return;
   const before = item.rotation || 0;
   const after = (before + 90) % 360;
   item.rotation = after;
   viewerApplyTransform();
+
+  // Share link: this viewer's own adjustment, kept on their device. Nothing
+  // is written to the owner's collection, so there's nothing to fail.
+  if (v.rotateMode === "local") {
+    setLocalRotation(v.cardId, item.side, after);
+    const tileImg = document.querySelector(`.share-card[data-card-id="${v.cardId}"] img`);
+    if (tileImg && item.side === "front") {
+      tileImg.className = rotClass(after).trim();
+    }
+    return;
+  }
+
   v.rotateBtn.disabled = true;
   try {
     await saveRotation(v.cardId, item.side, after);
@@ -4200,9 +4287,7 @@ function viewerSetSide(i) {
   v.ty = 0;
   v.img.src = v.items[i].src;
   v.img.alt = v.items[i].label;
-  // Rotating is the owner's action on their own card — a share-link visitor
-  // has nothing to save to.
-  v.rotateBtn.hidden = !(v.cardId && v.items[i].side);
+  v.rotateBtn.hidden = !(v.rotateMode !== "none" && v.cardId && v.items[i].side);
   viewerApplyTransform();
   if (v.items.length > 1) {
     v.sides.hidden = false;
@@ -4357,6 +4442,7 @@ function openImageViewer(items, index = 0, opts = {}) {
   const v = viewerState;
   v.items = items;
   v.cardId = opts.cardId || null;
+  v.rotateMode = opts.rotateMode || (opts.cardId ? "save" : "none");
   v.pointers.clear();
   v.pinch = null;
   v.lastTap = null;
@@ -4451,17 +4537,22 @@ document.addEventListener("click", (e) => {
       items.push({
         src: card.imageFrontUrl || img.src,
         label: "Front",
-        rotation: rotationOf(card, "front"),
+        side: "front",
+        rotation: sharedRotation(card, "front"),
       });
     }
     if (card.imageBackUrl) {
       items.push({
         src: card.imageBackUrl,
         label: "Back",
-        rotation: rotationOf(card, "back"),
+        side: "back",
+        rotation: sharedRotation(card, "back"),
       });
     }
-    if (items.length) openImageViewer(items, 0);
+    // rotateMode "local": the button turns the photo for this viewer only.
+    if (items.length) {
+      openImageViewer(items, 0, { cardId: card.id, rotateMode: "local" });
+    }
   }
 });
 
